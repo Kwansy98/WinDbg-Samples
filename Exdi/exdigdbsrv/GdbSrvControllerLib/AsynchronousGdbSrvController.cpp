@@ -347,13 +347,19 @@ unsigned AsynchronousGdbSrvController::CreateDataBreakpoint(_In_ AddressType add
         slot = static_cast<unsigned>(m_dataBreakpointSlots.size());
         m_dataBreakpointSlots.push_back(false);
     }
+    char breakCmd[128] = {0};
+    TargetArchitecture targetArchitecture = GdbSrvController::GetTargetArchitecture();
+    if (targetArchitecture == AMD64_ARCH && dataAccessType == daRead)
+    {
+        dataAccessType = daBoth;
+        accessWidth = accessWidth / 8;
+    }
+
     const char * pCommandType = GetDataAccessBreakPointCommand(dataAccessType, true);
     assert(pCommandType != nullptr);
 
-    char breakCmd[128] = {0}; 
-    TargetArchitecture targetArchitecture = GdbSrvController::GetTargetArchitecture();
     PCSTR pFormat = (targetArchitecture == ARM64_ARCH || targetArchitecture == AMD64_ARCH) ?
-                     "%s,%I64x,%d" : "%s,%x,%d";     
+                     "%s,%I64x,%d" : "%s,%x,%d";
     sprintf_s(breakCmd, _countof(breakCmd), pFormat, pCommandType, address, accessWidth);
 
     bool isReplyOK = false;
@@ -414,13 +420,19 @@ void AsynchronousGdbSrvController::DeleteDataBreakpoint(_In_ unsigned breakpoint
         throw std::exception("Trying to delete nonexisting data breakpoint");
     }
 
+    char breakCmd[128] = {0};
+    TargetArchitecture targetArchitecture = GdbSrvController::GetTargetArchitecture();
+    if (targetArchitecture == AMD64_ARCH && dataAccessType == daRead)
+    {
+        dataAccessType = daBoth;
+        accessWidth = accessWidth / 8;
+    }
+
     const char * pCommandType = GetDataAccessBreakPointCommand(dataAccessType, false);
     assert(pCommandType != nullptr);
 
-    char breakCmd[128] = {0}; 
-    TargetArchitecture targetArchitecture = GdbSrvController::GetTargetArchitecture();
     PCSTR pFormat = (targetArchitecture == ARM64_ARCH || targetArchitecture == AMD64_ARCH) ?
-                     "%s,%I64x,%d" : "%s,%x,%d";     
+                     "%s,%I64x,%d" : "%s,%x,%d";
     sprintf_s(breakCmd, _countof(breakCmd), pFormat, pCommandType, address, accessWidth);
 
     bool isReplyOK = false;

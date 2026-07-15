@@ -1,4 +1,4 @@
-﻿<ExdiTargets CurrentTarget = "QEMU">
+﻿<ExdiTargets CurrentTarget = "VMWare">
 
   <!-- Lauterbach Trace32 HW debugger GDB server configuration -->
   <ExdiTarget Name = "Trace32">
@@ -446,10 +446,10 @@
 
   <!-- VMWare GDB server configuration -->
   <ExdiTarget Name = "VMWare">
-      <ExdiGdbServerConfigData agentNamePacket = "" uuid = "72d4aeda-9723-4972-b89a-679ac79810ef" displayCommPackets = "yes" debuggerSessionByCore = "no" enableThrowExceptionOnMemoryErrors = "no" forceLegacyResumeStepCommands ="yes">
+      <ExdiGdbServerConfigData agentNamePacket = "" uuid = "72d4aeda-9723-4972-b89a-679ac79810ef" displayCommPackets = "no" debuggerSessionByCore = "no" enableThrowExceptionOnMemoryErrors = "no" forceLegacyResumeStepCommands ="yes" gdbMonitorCmdDoNotWaitOnOK = "no">
       <ExdiGdbServerTargetData targetArchitecture = "X64" targetFamily = "ProcessorFamilyX64" numberOfCores = "1" EnableSseContext = "no" heuristicScanSize = "0xffe" targetDescriptionFile = "" />
       <GdbServerConnectionParameters MultiCoreGdbServerSessions = "no" MaximumGdbServerPacketLength = "1024" MaximumConnectAttempts = "3" SendPacketTimeout = "100" ReceivePacketTimeout = "3000" >
-        <Value HostNameAndPort="localhost:1234" />
+        <Value HostNameAndPort="localhost:8864" />
       </GdbServerConnectionParameters>
       <ExdiGdbServerMemoryCommands GdbSpecialMemoryCommand = "no" PhysicalMemory = "no" SupervisorMemory = "no" HypervisorMemory = "no" SpecialMemoryRegister = "no" SystemRegistersGdbMonitor = "no" SystemRegisterDecoding = "no">
       </ExdiGdbServerMemoryCommands>

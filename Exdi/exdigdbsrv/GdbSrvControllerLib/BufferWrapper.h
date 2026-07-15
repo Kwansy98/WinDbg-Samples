@@ -69,9 +69,18 @@ namespace GdbSrvControllerLib
              return m_length;
          }
 
-         void SetLength(_In_ size_t newLength) 
+         void SetLength(_In_ size_t newLength)
          {
-             assert(newLength <= m_capacity);
+             if (newLength > m_capacity)
+             {
+                 bool capacityReady = TryEnsureCapacity(newLength);
+                 assert(capacityReady);
+                 if (!capacityReady)
+                 {
+                     return;
+                 }
+             }
+
              m_length = newLength;
          }
 

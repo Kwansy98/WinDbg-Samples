@@ -64,6 +64,8 @@ public:
           m_fEnableSSEContext(false),
           m_lastPcAddress(0),
           m_lastPSRvalue(0),
+          m_lastCr3(0),
+          m_lastCr4(0),
           m_heuristicChunkSize(0),
           m_RequireMemoryAccessByPA(false)
     {
@@ -299,6 +301,8 @@ public:
         bool m_fEnableSSEContext;
         ADDRESS_TYPE m_lastPcAddress;
         DWORD64 m_lastPSRvalue;
+        ADDRESS_TYPE m_lastCr3;
+        DWORD64 m_lastCr4;
         DWORD64 m_heuristicChunkSize;
         bool m_RequireMemoryAccessByPA;
 

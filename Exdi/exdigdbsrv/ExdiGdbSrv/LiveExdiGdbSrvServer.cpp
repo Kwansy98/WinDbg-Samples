@@ -25,6 +25,10 @@
 #include <string>
 #include <algorithm>
 #include <vector>
+#include <cctype>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 
 #define METHOD_NOT_IMPLEMENTED if (IsDebuggerPresent()) \
                                    __debugbreak(); \
@@ -74,6 +78,805 @@ const int s_numberOfCoprocessorRegisters = 8;
 const int s_numberOfBytesCoprocessorRegister = (SIZE_OF_80387_REGISTERS_IN_BYTES / s_numberOfCoprocessorRegisters);
 const char * s_fpRegList[] = {"st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7"};
 const int s_numberFPRegList = (ARRAYSIZE(s_fpRegList));
+
+namespace
+{
+    char ToAsciiHex(_In_ unsigned char value)
+    {
+        return static_cast<char>(value < 10 ? ('0' + value) : ('A' + value - 10));
+    }
+
+    bool TryDecodeAsciiHex(_In_ char value, _Out_ unsigned char* decoded)
+    {
+        if (value >= '0' && value <= '9')
+        {
+            *decoded = static_cast<unsigned char>(value - '0');
+            return true;
+        }
+
+        if (value >= 'a' && value <= 'f')
+        {
+            *decoded = static_cast<unsigned char>(value - 'a' + 10);
+            return true;
+        }
+
+        if (value >= 'A' && value <= 'F')
+        {
+            *decoded = static_cast<unsigned char>(value - 'A' + 10);
+            return true;
+        }
+
+        return false;
+    }
+
+    void AppendVMwareLog(_In_z_ const char* format, ...)
+    {
+        char tempPath[MAX_PATH] = {};
+        if (GetTempPathA(_countof(tempPath), tempPath) == 0)
+        {
+            return;
+        }
+
+        char logPath[MAX_PATH] = {};
+        if (sprintf_s(logPath, _countof(logPath), "%sExdiGdbSrv-vmware.log", tempPath) <= 0)
+        {
+            return;
+        }
+
+        FILE* logFile = nullptr;
+        if (fopen_s(&logFile, logPath, "a") != 0 || logFile == nullptr)
+        {
+            return;
+        }
+
+        va_list args;
+        va_start(args, format);
+        vfprintf(logFile, format, args);
+        va_end(args);
+        fclose(logFile);
+    }
+
+    bool IsCurrentTargetVMware()
+    {
+        std::wstring targetName;
+        ConfigExdiGdbServerHelper::GetInstanceCfgExdiGdbServer(nullptr).GetGdbServerTargetName(targetName);
+        return _wcsicmp(targetName.c_str(), L"VMWare") == 0 ||
+               _wcsicmp(targetName.c_str(), L"VMware") == 0;
+    }
+
+    bool TryParseHexValue(_In_ const std::string& text, _In_ const char* marker, _Out_ ULONG64* value)
+    {
+        size_t valueOffset = text.find(marker);
+        if (valueOffset == std::string::npos)
+        {
+            return false;
+        }
+
+        valueOffset += strlen(marker);
+        while (valueOffset < text.length() &&
+               (text[valueOffset] == ' ' ||
+                text[valueOffset] == '\t' ||
+                text[valueOffset] == ':' ||
+                text[valueOffset] == '='))
+        {
+            ++valueOffset;
+        }
+
+        if (valueOffset + 1 < text.length() &&
+            text[valueOffset] == '0' &&
+            (text[valueOffset + 1] == 'x' || text[valueOffset + 1] == 'X'))
+        {
+            valueOffset += 2;
+        }
+
+        std::string digits;
+        for (; valueOffset < text.length(); ++valueOffset)
+        {
+            char ch = text[valueOffset];
+            if (ch == '`')
+            {
+                continue;
+            }
+
+            if (!std::isxdigit(static_cast<unsigned char>(ch)))
+            {
+                break;
+            }
+
+            digits.push_back(ch);
+        }
+
+        if (digits.empty())
+        {
+            return false;
+        }
+
+        *value = _strtoui64(digits.c_str(), nullptr, 16);
+        return true;
+    }
+
+    bool TryBuildMonitorCommand(_In_ LPCWSTR command, _Out_ std::string* encodedCommand)
+    {
+        char narrowCommand[128] = {};
+        if (WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, command, -1, narrowCommand, _countof(narrowCommand), nullptr, nullptr) == 0)
+        {
+            return false;
+        }
+
+        encodedCommand->assign("qRcmd,");
+        for (const char* cursor = narrowCommand; *cursor != '\0'; ++cursor)
+        {
+            unsigned char value = static_cast<unsigned char>(*cursor);
+            encodedCommand->push_back(ToAsciiHex((value >> 4) & 0x0f));
+            encodedCommand->push_back(ToAsciiHex(value & 0x0f));
+        }
+
+        return true;
+    }
+
+    bool TryDecodeConsoleOutputPacket(_In_ const std::string& reply, _Out_ std::string* output)
+    {
+        if (reply.length() < 3 || reply[0] != 'O')
+        {
+            return false;
+        }
+
+        output->clear();
+        for (size_t index = 1; index + 1 < reply.length(); index += 2)
+        {
+            unsigned char high = 0;
+            unsigned char low = 0;
+            if (!TryDecodeAsciiHex(reply[index], &high) ||
+                !TryDecodeAsciiHex(reply[index + 1], &low))
+            {
+                return false;
+            }
+
+            output->push_back(static_cast<char>((high << 4) | low));
+        }
+
+        return true;
+    }
+
+    bool IsExpectedVMwareMonitorOutput(_In_ const std::string& output, _In_ const char* expectedToken)
+    {
+        size_t offset = 0;
+        while (offset < output.length() && std::isspace(static_cast<unsigned char>(output[offset])))
+        {
+            ++offset;
+        }
+
+        size_t tokenLength = strlen(expectedToken);
+        return output.length() >= offset + tokenLength &&
+               _strnicmp(output.c_str() + offset, expectedToken, tokenLength) == 0;
+    }
+
+    bool QueryVMwareMonitor(
+        _In_ GdbSrvController* pController,
+        _In_ LPCWSTR command,
+        _In_ const char* expectedToken,
+        _Out_ std::string* output)
+    {
+        std::string encodedCommand;
+        if (!TryBuildMonitorCommand(command, &encodedCommand))
+        {
+            return false;
+        }
+
+        unsigned activeCpu = pController->GetLastKnownActiveCpu();
+        std::string reply = pController->ExecuteCommandOnProcessor(
+            encodedCommand.c_str(),
+            true,
+            0,
+            activeCpu);
+
+        char commandText[128] = {};
+        WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, command, -1, commandText, _countof(commandText), nullptr, nullptr);
+        bool foundExpectedOutput = false;
+        for (int attempt = 0; attempt < 8; ++attempt)
+        {
+            if (reply == "OK")
+            {
+                AppendVMwareLog("monitor '%s' attempt=%d raw='OK' completed=%d\n", commandText, attempt, foundExpectedOutput ? 1 : 0);
+                if (foundExpectedOutput)
+                {
+                    return true;
+                }
+            }
+
+            bool decoded = TryDecodeConsoleOutputPacket(reply, output);
+            AppendVMwareLog("monitor '%s' attempt=%d raw='%s' decoded='%s'\n", commandText, attempt, reply.c_str(), decoded ? output->c_str() : "");
+            if (decoded && IsExpectedVMwareMonitorOutput(*output, expectedToken))
+            {
+                foundExpectedOutput = true;
+            }
+
+            try
+            {
+                reply = pController->GetResponseOnProcessor(0, activeCpu);
+            }
+            catch (const _com_error& error)
+            {
+                AppendVMwareLog("monitor '%s' no matching response, hr=%08x\n", commandText, error.Error());
+                return false;
+            }
+        }
+
+        AppendVMwareLog("monitor '%s' exhausted stale responses completed=%d\n", commandText, foundExpectedOutput ? 1 : 0);
+        return false;
+    }
+
+    bool ExecuteVMwareMonitorCommand(
+        _In_ GdbSrvController* pController,
+        _In_ LPCWSTR command)
+    {
+        std::string encodedCommand;
+        if (!TryBuildMonitorCommand(command, &encodedCommand))
+        {
+            return false;
+        }
+
+        unsigned activeCpu = pController->GetLastKnownActiveCpu();
+        std::string reply = pController->ExecuteCommandOnProcessor(
+            encodedCommand.c_str(),
+            true,
+            0,
+            activeCpu);
+
+        char commandText[128] = {};
+        WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, command, -1, commandText, _countof(commandText), nullptr, nullptr);
+        for (int attempt = 0; attempt < 8; ++attempt)
+        {
+            if (reply == "OK")
+            {
+                return true;
+            }
+
+            if (!reply.empty() && reply[0] == 'E')
+            {
+                AppendVMwareLog("monitor '%s' failed raw='%s'\n", commandText, reply.c_str());
+                return false;
+            }
+
+            try
+            {
+                reply = pController->GetResponseOnProcessor(0, activeCpu);
+            }
+            catch (const _com_error& error)
+            {
+                AppendVMwareLog("monitor '%s' no OK, hr=%08x\n", commandText, error.Error());
+                return false;
+            }
+        }
+
+        AppendVMwareLog("monitor '%s' exhausted waiting for OK\n", commandText);
+        return false;
+    }
+
+    bool DecodeHexMemoryPacket(
+        _In_ const std::string& reply,
+        _Out_writes_bytes_(size) void* data,
+        _In_ size_t size)
+    {
+        if (reply.length() < size * 2 ||
+            (!reply.empty() && reply[0] == 'E'))
+        {
+            return false;
+        }
+
+        BYTE* bytes = static_cast<BYTE*>(data);
+        for (size_t index = 0; index < size; ++index)
+        {
+            unsigned char high = 0;
+            unsigned char low = 0;
+            if (!TryDecodeAsciiHex(reply[index * 2], &high) ||
+                !TryDecodeAsciiHex(reply[(index * 2) + 1], &low))
+            {
+                return false;
+            }
+
+            bytes[index] = static_cast<BYTE>((high << 4) | low);
+        }
+
+        return true;
+    }
+
+    bool ReadVMwarePhysicalMemory(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE physicalAddress,
+        _Out_writes_bytes_(size) void* data,
+        _In_ size_t size)
+    {
+        if (!ExecuteVMwareMonitorCommand(pController, L"phys"))
+        {
+            AppendVMwareLog("failed to enter VMware physical memory mode\n");
+            return false;
+        }
+
+        constexpr size_t maxPhysicalReadChunk = 0x100;
+        BYTE* output = static_cast<BYTE*>(data);
+        size_t bytesLeft = size;
+        ADDRESS_TYPE currentAddress = physicalAddress;
+        bool readOk = true;
+
+        while (bytesLeft != 0)
+        {
+            const size_t bytesToRead = (std::min)(bytesLeft, maxPhysicalReadChunk);
+            char command[64] = {};
+            sprintf_s(command, _countof(command), "m%I64x,%x", static_cast<ULONGLONG>(currentAddress), static_cast<unsigned>(bytesToRead));
+
+            std::string reply;
+            try
+            {
+                reply = pController->ExecuteCommandOnProcessor(
+                    command,
+                    true,
+                    (bytesToRead * 2) + 256,
+                    pController->GetLastKnownActiveCpu());
+                if (!DecodeHexMemoryPacket(reply, output, bytesToRead))
+                {
+                    AppendVMwareLog(
+                        "VMware physical read bad reply pa=%I64x size=%Iu raw='%s'\n",
+                        static_cast<ULONGLONG>(currentAddress),
+                        bytesToRead,
+                        reply.c_str());
+                    readOk = false;
+                    break;
+                }
+            }
+            catch (const _com_error& error)
+            {
+                AppendVMwareLog(
+                    "VMware physical read exception pa=%I64x size=%Iu hr=%08x\n",
+                    static_cast<ULONGLONG>(currentAddress),
+                    bytesToRead,
+                    error.Error());
+                readOk = false;
+                break;
+            }
+
+            output += bytesToRead;
+            currentAddress += bytesToRead;
+            bytesLeft -= bytesToRead;
+        }
+
+        if (!ExecuteVMwareMonitorCommand(pController, L"virt"))
+        {
+            AppendVMwareLog("failed to restore VMware virtual memory mode\n");
+            return false;
+        }
+
+        return readOk;
+    }
+
+    void QueryVMwareScalarRegister(
+        _In_ GdbSrvController* pController,
+        _In_ LPCWSTR command,
+        _In_ const char* registerName,
+        _Inout_ std::map<std::string, std::string>& registers)
+    {
+        std::string output;
+        ULONG64 value = 0;
+        if (QueryVMwareMonitor(pController, command, registerName, &output) &&
+            TryParseHexValue(output, "=", &value))
+        {
+            char valueString[32] = {};
+            sprintf_s(valueString, _countof(valueString), "%I64x", value);
+            registers[registerName] = valueString;
+        }
+    }
+
+    void QueryVMwareDescriptorRegister(
+        _In_ GdbSrvController* pController,
+        _In_ LPCWSTR command,
+        _In_ const char* baseName,
+        _In_ const char* limitName,
+        _Inout_ std::map<std::string, std::string>& registers)
+    {
+        std::string output;
+        ULONG64 base = 0;
+        ULONG64 limit = 0;
+        const char* expectedToken = strncmp(baseName, "gdtr", 4) == 0 ? "gdtr" : "idtr";
+        if (QueryVMwareMonitor(pController, command, expectedToken, &output) &&
+            TryParseHexValue(output, "base", &base) &&
+            TryParseHexValue(output, "limit", &limit))
+        {
+            char valueString[32] = {};
+            sprintf_s(valueString, _countof(valueString), "%I64x", base);
+            registers[baseName] = valueString;
+
+            sprintf_s(valueString, _countof(valueString), "%I64x", limit);
+            registers[limitName] = valueString;
+            AppendVMwareLog("parsed %s=%s %s=%s\n", baseName, registers[baseName].c_str(), limitName, registers[limitName].c_str());
+        }
+        else
+        {
+            AppendVMwareLog("failed to parse descriptor output '%s'\n", output.c_str());
+        }
+    }
+
+    void QueryVMwareSpecialRegisters(
+        _In_ GdbSrvController* pController,
+        _Inout_ std::map<std::string, std::string>& registers)
+    {
+        QueryVMwareScalarRegister(pController, L"r cr0", "cr0", registers);
+        QueryVMwareScalarRegister(pController, L"r cr2", "cr2", registers);
+        QueryVMwareScalarRegister(pController, L"r cr3", "cr3", registers);
+        QueryVMwareScalarRegister(pController, L"r cr4", "cr4", registers);
+        QueryVMwareScalarRegister(pController, L"r cr8", "cr8", registers);
+        QueryVMwareDescriptorRegister(pController, L"r gdtr", "gdtrbase", "gdtrlimit", registers);
+        QueryVMwareDescriptorRegister(pController, L"r idtr", "idtrbase", "idtrlimit", registers);
+    }
+
+    bool ReadTargetMemory(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE address,
+        _Out_writes_bytes_(size) void* data,
+        _In_ size_t size,
+        _In_ const memoryAccessType memoryType)
+    {
+        try
+        {
+            SimpleCharBuffer buffer = pController->ReadMemory(address, size, memoryType);
+            if (buffer.GetLength() != size)
+            {
+                return false;
+            }
+
+            memcpy(data, buffer.GetInternalBuffer(), size);
+            return true;
+        }
+        catch (const _com_error&)
+        {
+            return false;
+        }
+    }
+
+    bool ReadTargetPhysicalMemory(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE physicalAddress,
+        _Out_writes_bytes_(size) void* data,
+        _In_ size_t size)
+    {
+        if (IsCurrentTargetVMware())
+        {
+            return ReadVMwarePhysicalMemory(pController, physicalAddress, data, size);
+        }
+
+        memoryAccessType physicalMemory = {};
+        physicalMemory.isPhysical = 1;
+        return ReadTargetMemory(pController, physicalAddress, data, size, physicalMemory);
+    }
+
+    bool ReadTargetPhysicalU64(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE physicalAddress,
+        _Out_ ULONGLONG* value)
+    {
+        *value = 0;
+        return ReadTargetPhysicalMemory(pController, physicalAddress, value, sizeof(*value));
+    }
+
+    bool TryTranslateX64VirtualAddress(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE cr3,
+        _In_ ADDRESS_TYPE virtualAddress,
+        _Out_ ADDRESS_TYPE* physicalAddress)
+    {
+        constexpr ULONGLONG pageOffsetMask = 0xfff;
+        constexpr ULONGLONG pageFrameMask = 0x000ffffffffff000ULL;
+        constexpr ULONGLONG largePage2MbMask = 0x000fffffffe00000ULL;
+        constexpr ULONGLONG largePage1GbMask = 0x000fffffc0000000ULL;
+        constexpr ULONGLONG presentBit = 1;
+        constexpr ULONGLONG largePageBit = 1ULL << 7;
+
+        if (cr3 == 0 || physicalAddress == nullptr)
+        {
+            return false;
+        }
+
+        ULONGLONG pml4 = static_cast<ULONGLONG>(cr3) & pageFrameMask;
+        ULONGLONG pml4e = 0;
+        ULONGLONG pdpte = 0;
+        ULONGLONG pde = 0;
+        ULONGLONG pte = 0;
+        const ULONGLONG va = static_cast<ULONGLONG>(virtualAddress);
+
+        const ULONGLONG pml4Index = (va >> 39) & 0x1ff;
+        const ULONGLONG pdptIndex = (va >> 30) & 0x1ff;
+        const ULONGLONG pdIndex = (va >> 21) & 0x1ff;
+        const ULONGLONG ptIndex = (va >> 12) & 0x1ff;
+        const ADDRESS_TYPE pml4eAddress = static_cast<ADDRESS_TYPE>(pml4 + (pml4Index * sizeof(ULONGLONG)));
+
+        if (!ReadTargetPhysicalU64(pController, pml4eAddress, &pml4e))
+        {
+            AppendVMwareLog("vtop pml4 read failed cr3=%I64x va=%I64x pml4=%I64x index=%I64x entryPa=%I64x\n",
+                static_cast<ULONGLONG>(cr3),
+                va,
+                pml4,
+                pml4Index,
+                static_cast<ULONGLONG>(pml4eAddress));
+            return false;
+        }
+
+        if ((pml4e & presentBit) == 0)
+        {
+            return false;
+        }
+
+        const ADDRESS_TYPE pdpteAddress = static_cast<ADDRESS_TYPE>((pml4e & pageFrameMask) + (pdptIndex * sizeof(ULONGLONG)));
+        if (!ReadTargetPhysicalU64(pController, pdpteAddress, &pdpte))
+        {
+            AppendVMwareLog("vtop pdpt read failed cr3=%I64x va=%I64x index=%I64x entryPa=%I64x\n",
+                static_cast<ULONGLONG>(cr3),
+                va,
+                pdptIndex,
+                static_cast<ULONGLONG>(pdpteAddress));
+            return false;
+        }
+
+        if ((pdpte & presentBit) == 0)
+        {
+            return false;
+        }
+
+        if ((pdpte & largePageBit) != 0)
+        {
+            *physicalAddress = static_cast<ADDRESS_TYPE>((pdpte & largePage1GbMask) + (va & 0x3fffffffULL));
+            return true;
+        }
+
+        const ADDRESS_TYPE pdeAddress = static_cast<ADDRESS_TYPE>((pdpte & pageFrameMask) + (pdIndex * sizeof(ULONGLONG)));
+        if (!ReadTargetPhysicalU64(pController, pdeAddress, &pde))
+        {
+            AppendVMwareLog("vtop pd read failed cr3=%I64x va=%I64x index=%I64x entryPa=%I64x\n",
+                static_cast<ULONGLONG>(cr3),
+                va,
+                pdIndex,
+                static_cast<ULONGLONG>(pdeAddress));
+            return false;
+        }
+
+        if ((pde & presentBit) == 0)
+        {
+            return false;
+        }
+
+        if ((pde & largePageBit) != 0)
+        {
+            *physicalAddress = static_cast<ADDRESS_TYPE>((pde & largePage2MbMask) + (va & 0x1fffffULL));
+            return true;
+        }
+
+        const ADDRESS_TYPE pteAddress = static_cast<ADDRESS_TYPE>((pde & pageFrameMask) + (ptIndex * sizeof(ULONGLONG)));
+        if (!ReadTargetPhysicalU64(pController, pteAddress, &pte))
+        {
+            AppendVMwareLog("vtop pt read failed cr3=%I64x va=%I64x index=%I64x entryPa=%I64x\n",
+                static_cast<ULONGLONG>(cr3),
+                va,
+                ptIndex,
+                static_cast<ULONGLONG>(pteAddress));
+            return false;
+        }
+
+        if ((pte & presentBit) == 0)
+        {
+            return false;
+        }
+
+        *physicalAddress = static_cast<ADDRESS_TYPE>((pte & pageFrameMask) + (va & pageOffsetMask));
+        return true;
+    }
+
+    bool ReadTargetVirtualMemory(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE cr3,
+        _In_ ADDRESS_TYPE virtualAddress,
+        _Out_writes_bytes_(size) void* data,
+        _In_ size_t size)
+    {
+        constexpr ADDRESS_TYPE pageSize = 0x1000;
+        BYTE* output = static_cast<BYTE*>(data);
+        ADDRESS_TYPE address = virtualAddress;
+        size_t bytesLeft = size;
+
+        while (bytesLeft != 0)
+        {
+            ADDRESS_TYPE physicalAddress = 0;
+            if (!TryTranslateX64VirtualAddress(pController, cr3, address, &physicalAddress))
+            {
+                return false;
+            }
+
+            size_t pageBytesLeft = static_cast<size_t>(pageSize - (address & (pageSize - 1)));
+            size_t bytesToRead = (std::min)(bytesLeft, pageBytesLeft);
+            if (!ReadTargetPhysicalMemory(pController, physicalAddress, output, bytesToRead))
+            {
+                return false;
+            }
+
+            output += bytesToRead;
+            address += bytesToRead;
+            bytesLeft -= bytesToRead;
+        }
+
+        return true;
+    }
+
+    bool ReadTargetVirtualMemoryBuffer(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE cr3,
+        _In_ ADDRESS_TYPE virtualAddress,
+        _In_ size_t size,
+        _Out_ SimpleCharBuffer* buffer)
+    {
+        if (!buffer->TryEnsureCapacity(size))
+        {
+            throw _com_error(E_OUTOFMEMORY);
+        }
+
+        buffer->SetLength(size);
+        if (size == 0)
+        {
+            return true;
+        }
+
+        return ReadTargetVirtualMemory(pController, cr3, virtualAddress, buffer->GetInternalBuffer(), size);
+    }
+
+    bool IsKernelImageCandidate(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE imageBase,
+        _In_ ADDRESS_TYPE cr3,
+        _In_ ADDRESS_TYPE codeAddress)
+    {
+        IMAGE_DOS_HEADER dosHeader = {};
+        if (!ReadTargetVirtualMemory(pController, cr3, imageBase, &dosHeader, sizeof(dosHeader)) ||
+            dosHeader.e_magic != IMAGE_DOS_SIGNATURE ||
+            dosHeader.e_lfanew <= 0 ||
+            dosHeader.e_lfanew >= 0x100000)
+        {
+            return false;
+        }
+
+        IMAGE_NT_HEADERS64 ntHeaders = {};
+        if (!ReadTargetVirtualMemory(pController, cr3, imageBase + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders)) ||
+            ntHeaders.Signature != IMAGE_NT_SIGNATURE ||
+            ntHeaders.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+            ntHeaders.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+            ntHeaders.OptionalHeader.Subsystem != IMAGE_SUBSYSTEM_NATIVE ||
+            ntHeaders.OptionalHeader.SizeOfImage < 0x100000 ||
+            ntHeaders.OptionalHeader.SizeOfImage > 0x40000000 ||
+            ntHeaders.OptionalHeader.SectionAlignment < 0x1000 ||
+            ntHeaders.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_DEBUG)
+        {
+            return false;
+        }
+
+        const DWORD sectionCount = (std::min)(static_cast<DWORD>(ntHeaders.FileHeader.NumberOfSections), static_cast<DWORD>(32));
+        std::vector<IMAGE_SECTION_HEADER> sections(sectionCount);
+        ADDRESS_TYPE sectionHeadersAddress = imageBase + dosHeader.e_lfanew + FIELD_OFFSET(IMAGE_NT_HEADERS64, OptionalHeader) + ntHeaders.FileHeader.SizeOfOptionalHeader;
+        if (sectionCount == 0 ||
+            !ReadTargetVirtualMemory(pController, cr3, sectionHeadersAddress, sections.data(), sections.size() * sizeof(IMAGE_SECTION_HEADER)))
+        {
+            return false;
+        }
+
+        bool containsCodeAddress = false;
+        for (const IMAGE_SECTION_HEADER& section : sections)
+        {
+            DWORD sectionSize = (std::max)(static_cast<DWORD>(section.Misc.VirtualSize), static_cast<DWORD>(section.SizeOfRawData));
+            ADDRESS_TYPE sectionStart = imageBase + section.VirtualAddress;
+            ADDRESS_TYPE sectionEnd = sectionStart + sectionSize;
+            if ((section.Characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE)) != 0 &&
+                codeAddress >= sectionStart &&
+                codeAddress < sectionEnd)
+            {
+                containsCodeAddress = true;
+                break;
+            }
+        }
+
+        if (!containsCodeAddress)
+        {
+            return false;
+        }
+
+        AppendVMwareLog(
+            "kernel PE candidate base=%I64x size=%x entry=%x imagebase=%I64x\n",
+            static_cast<ULONGLONG>(imageBase),
+            ntHeaders.OptionalHeader.SizeOfImage,
+            ntHeaders.OptionalHeader.AddressOfEntryPoint,
+            ntHeaders.OptionalHeader.ImageBase);
+        return true;
+    }
+
+    HRESULT FindNtImageBaseNearAddress(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE codeAddress,
+        _In_ ADDRESS_TYPE cr3,
+        _In_z_ const char* sourceName,
+        _Out_ ADDRESS_TYPE* ntBaseAddress)
+    {
+        if (codeAddress == 0 || cr3 == 0 || ntBaseAddress == nullptr)
+        {
+            return E_INVALIDARG;
+        }
+
+        constexpr ULONGLONG pageSize = 0x10000;
+        ULONGLONG searchAddress = static_cast<ULONGLONG>(codeAddress) & ~(pageSize - 1);
+        constexpr ULONGLONG maxSearchDistance = 0x08000000;
+        constexpr ULONGLONG minimumKernelBase = 0xFFFFF80000000000ULL;
+        ULONGLONG searchedDistance = 0;
+        AppendVMwareLog("ntbase scan source=%s start=%I64x max=%I64x step=%I64x\n", sourceName, searchAddress, maxSearchDistance, pageSize);
+        while (searchAddress >= minimumKernelBase && searchedDistance < maxSearchDistance)
+        {
+            if (IsKernelImageCandidate(pController, static_cast<ADDRESS_TYPE>(searchAddress), cr3, codeAddress))
+            {
+                *ntBaseAddress = static_cast<ADDRESS_TYPE>(searchAddress);
+                AppendVMwareLog("ntbase found source=%s base=%I64x\n", sourceName, searchAddress);
+                return S_OK;
+            }
+
+            searchAddress -= pageSize;
+            searchedDistance += pageSize;
+            if ((searchedDistance & 0x00FFFFFFULL) == 0)
+            {
+                AppendVMwareLog("ntbase scan progress source=%s distance=%I64x address=%I64x\n", sourceName, searchedDistance, searchAddress);
+            }
+        }
+
+        AppendVMwareLog("ntbase scan failed source=%s distance=%I64x\n", sourceName, searchedDistance);
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+
+    HRESULT FindNtBaseAddressFromIdt(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE idtBase,
+        _In_ ADDRESS_TYPE cr3,
+        _Out_ ADDRESS_TYPE* ntBaseAddress)
+    {
+        if (idtBase == 0 || cr3 == 0 || ntBaseAddress == nullptr)
+        {
+            return E_INVALIDARG;
+        }
+
+        WORD idtEntry[8] = {};
+        if (!ReadTargetVirtualMemory(pController, cr3, idtBase, idtEntry, sizeof(idtEntry)))
+        {
+            AppendVMwareLog("failed to read IDT base=%I64x\n", static_cast<ULONGLONG>(idtBase));
+            return E_FAIL;
+        }
+
+        ADDRESS_TYPE interruptHandler =
+            (static_cast<ADDRESS_TYPE>(idtEntry[5]) << 48) |
+            (static_cast<ADDRESS_TYPE>(idtEntry[4]) << 32) |
+            (static_cast<ADDRESS_TYPE>(idtEntry[3]) << 16) |
+            static_cast<ADDRESS_TYPE>(idtEntry[0]);
+        AppendVMwareLog("IDT[0] handler=%I64x\n", static_cast<ULONGLONG>(interruptHandler));
+        return FindNtImageBaseNearAddress(pController, interruptHandler, cr3, "idt", ntBaseAddress);
+    }
+
+    HRESULT FindNtBaseAddressFromContext(
+        _In_ GdbSrvController* pController,
+        _In_ const CONTEXT_X86_64& currentContext,
+        _Out_ ADDRESS_TYPE* ntBaseAddress)
+    {
+        if (currentContext.IDTBase == 0)
+        {
+            AppendVMwareLog("IDT base unavailable for NT base lookup\n");
+            return E_INVALIDARG;
+        }
+
+        if (currentContext.RegCr3 == 0)
+        {
+            AppendVMwareLog("CR3 unavailable for NT base lookup\n");
+            return E_INVALIDARG;
+        }
+
+        return FindNtBaseAddressFromIdt(pController, currentContext.IDTBase, currentContext.RegCr3, ntBaseAddress);
+    }
+}
 
 //=============================================================================
 // Public function definitions
@@ -534,6 +1337,35 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::ReadVirtualMemory(
         memoryAccessType memType = {0};
         pController->GetMemoryPacketType(m_lastPSRvalue, &memType);
 
+        if (IsCurrentTargetVMware())
+        {
+            ADDRESS_TYPE cr3 = m_lastCr3;
+            if (cr3 == 0)
+            {
+                CONTEXT_X86_64 currentContext = {};
+                HRESULT contextResult = GetContextEx(0, &currentContext);
+                if (contextResult == S_OK)
+                {
+                    cr3 = currentContext.RegCr3;
+                }
+            }
+
+            if (cr3 != 0)
+            {
+                SimpleCharBuffer translatedBuffer;
+                if (ReadTargetVirtualMemoryBuffer(pController, cr3, Address, dwBytesToRead, &translatedBuffer))
+                {
+                    return SafeArrayFromByteArray(translatedBuffer.GetInternalBuffer(), translatedBuffer.GetLength(), pbReadBuffer);
+                }
+
+                AppendVMwareLog("ReadVirtualMemory short read va=%I64x size=%x cr3=%I64x\n",
+                    static_cast<ULONGLONG>(Address),
+                    dwBytesToRead,
+                    static_cast<ULONGLONG>(cr3));
+                return SafeArrayFromByteArray("", 0, pbReadBuffer);
+            }
+        }
+
         SimpleCharBuffer buffer = pController->ReadMemory(Address, dwBytesToRead, memType);
         return SafeArrayFromByteArray(buffer.GetInternalBuffer(), buffer.GetLength(), pbReadBuffer);
     }
@@ -735,10 +1567,20 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::Ioctl(
             }
             break;
 
-            //  This is not implemented by this COM server Exdi .
+            // Locate ntoskrnl through the IDT when dbgeng asks the EXDI server for NT base.
             case DBGENG_EXDI_IOCTL_V3_GET_NT_BASE_ADDRESS_VALUE:
             {
-                hr = E_NOTIMPL;
+                CONTEXT_X86_64 currentContext = {};
+                ADDRESS_TYPE ntBaseAddress = 0;
+                hr = GetContextEx(0, &currentContext);
+                if (hr == S_OK)
+                {
+                    hr = FindNtBaseAddressFromContext(pController, currentContext, &ntBaseAddress);
+                    if (hr == S_OK)
+                    {
+                        hr = SafeArrayFromByteArray(reinterpret_cast<const char*>(&ntBaseAddress), sizeof(ntBaseAddress), pOutputBuffer);
+                    }
+                }
             }
             break;
 
@@ -772,6 +1614,39 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::Ioctl(
                     {
                         memoryType.isSupervisor = 1;
                     }
+
+                    if (IsCurrentTargetVMware())
+                    {
+                        ADDRESS_TYPE cr3 = m_lastCr3;
+                        if (cr3 == 0)
+                        {
+                            CONTEXT_X86_64 currentContext = {};
+                            HRESULT contextResult = GetContextEx(0, &currentContext);
+                            if (contextResult == S_OK)
+                            {
+                                cr3 = currentContext.RegCr3;
+                            }
+                        }
+
+                        if (cr3 != 0)
+                        {
+                            SimpleCharBuffer translatedBuffer;
+                            if (ReadTargetVirtualMemoryBuffer(pController, cr3, pSpecialRegs->address, pSpecialRegs->bytesToRead, &translatedBuffer))
+                            {
+                                hr = SafeArrayFromByteArray(translatedBuffer.GetInternalBuffer(), translatedBuffer.GetLength(), pOutputBuffer);
+                                break;
+                            }
+
+                            AppendVMwareLog("special memory short read va=%I64x size=%x cr3=%I64x code=%d\n",
+                                static_cast<ULONGLONG>(pSpecialRegs->address),
+                                pSpecialRegs->bytesToRead,
+                                static_cast<ULONGLONG>(cr3),
+                                static_cast<int>(ioctlCode));
+                            hr = SafeArrayFromByteArray("", 0, pOutputBuffer);
+                            break;
+                        }
+                    }
+
                     SimpleCharBuffer buffer = pController->ReadMemory(pSpecialRegs->address, pSpecialRegs->bytesToRead, memoryType);
                     hr = SafeArrayFromByteArray(buffer.GetInternalBuffer(), buffer.GetLength(), pOutputBuffer);
                 }
@@ -1191,6 +2066,10 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::GetContextEx(_In_ DWORD process
         pContext->DescriptorDs.SegFlags = static_cast<DWORD>(-1);
 
         std::map<std::string, std::string> registers = pController->QueryAllRegisters(processorNumber);
+        if (IsCurrentTargetVMware())
+        {
+            QueryVMwareSpecialRegisters(pController, registers);
+        }
         pContext->Rax = GdbSrvController::ParseRegisterValue(registers["rax"]);
         pContext->Rbx = GdbSrvController::ParseRegisterValue(registers["rbx"]);
         pContext->Rcx = GdbSrvController::ParseRegisterValue(registers["rcx"]);
@@ -1243,6 +2122,8 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::GetContextEx(_In_ DWORD process
             pContext->RegCr4 = GdbSrvController::ParseRegisterValue(registers["cr4"]);
             pContext->RegCr8 = GdbSrvController::ParseRegisterValue(registers["cr8"]);
             pContext->RegGroupSelection.fSystemRegisters = TRUE;
+            m_lastCr3 = pContext->RegCr3;
+            m_lastCr4 = pContext->RegCr4;
         }
 
         //  Get all floating point registers (FPU)
