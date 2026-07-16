@@ -10,16 +10,28 @@ if not exist "%SCRIPT%" (
     exit /b 1
 )
 
+where pyw >nul 2>nul
+if %errorlevel%==0 (
+    start "" pyw -3 "%SCRIPT%"
+    exit /b 0
+)
+
+where pythonw >nul 2>nul
+if %errorlevel%==0 (
+    start "" pythonw "%SCRIPT%"
+    exit /b 0
+)
+
 where py >nul 2>nul
 if %errorlevel%==0 (
-    py -3 "%SCRIPT%"
+    start "" py -3 "%SCRIPT%"
     if errorlevel 1 pause
     exit /b %errorlevel%
 )
 
 where python >nul 2>nul
 if %errorlevel%==0 (
-    python "%SCRIPT%"
+    start "" python "%SCRIPT%"
     if errorlevel 1 pause
     exit /b %errorlevel%
 )
