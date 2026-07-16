@@ -18,6 +18,7 @@
 #include "GdbSrvControllerLib.h"
 #include <string>
 #include <memory>
+#include <vector>
 
 
 
@@ -64,8 +65,9 @@ public:
           m_fEnableSSEContext(false),
           m_lastPcAddress(0),
           m_lastPSRvalue(0),
-          m_lastCr3(0),
-          m_lastCr4(0),
+          m_kernelCr3(0),
+          m_ntBaseAddress(0),
+          m_kdDebuggerDataAddress(0),
           m_heuristicChunkSize(0),
           m_RequireMemoryAccessByPA(false)
     {
@@ -301,8 +303,12 @@ public:
         bool m_fEnableSSEContext;
         ADDRESS_TYPE m_lastPcAddress;
         DWORD64 m_lastPSRvalue;
-        ADDRESS_TYPE m_lastCr3;
-        DWORD64 m_lastCr4;
+        std::vector<ADDRESS_TYPE> m_processorCr3;
+        ADDRESS_TYPE m_kernelCr3;
+        ADDRESS_TYPE m_ntBaseAddress;
+        std::vector<BYTE> m_kdVersionBlock;
+        ADDRESS_TYPE m_kdDebuggerDataAddress;
+        std::vector<BYTE> m_decodedKdDebuggerData;
         DWORD64 m_heuristicChunkSize;
         bool m_RequireMemoryAccessByPA;
 
@@ -325,6 +331,12 @@ public:
         void GetNeonRegisters(_In_ GdbSrvControllerLib::AsynchronousGdbSrvController * const pController, 
                               _In_ std::map<std::string, std::string> &registers, _Out_ PVOID pContext);
         void SetNeonRegisters(_In_ DWORD processorNumber, _In_ const VOID * pContext, _In_ GdbSrvControllerLib::AsynchronousGdbSrvController * const pController);
+        ADDRESS_TYPE GetVMwareCr3(_In_ ADDRESS_TYPE virtualAddress);
+        HRESULT InitializeWindowsDebuggerData(
+            _In_ GdbSrvControllerLib::AsynchronousGdbSrvController* pController,
+            _In_ ADDRESS_TYPE ntBaseAddress,
+            _In_ ADDRESS_TYPE cr3);
+        void OverlayKdDebuggerData(_In_ ADDRESS_TYPE address, _Inout_updates_bytes_(size) void* data, _In_ size_t size) const;
         static DWORD CALLBACK NotificationThreadBody(LPVOID p);
         static VOID CALLBACK TimerCallback(_In_ HWND hwnd, _In_  UINT uMsg, _In_  UINT_PTR idEvent, _In_  DWORD dwTime);
 

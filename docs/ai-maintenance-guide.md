@@ -13,11 +13,11 @@
 不要 push，除非我明确要求。不要把构建、部署、清理逻辑重新塞回 exdi_manager.py。
 ```
 
-如果要继续调试 `KdDebuggerDataBlock`，可以发：
+如果要继续分析剩余的 EXDI 上下文限制，可以发：
 
 ```text
-继续分析 VMware EXDI 下 KdDebuggerDataBlock 读取失败的问题。
-先基于现有 NT base、虚拟地址读取、断点和单步能力，定位 WinDbg 为什么仍提示 Unable to read debugger data block header。
+继续分析 VMware EXDI 下 GS base、MSR 和 kdexts PteBase 的剩余问题。
+先基于现有 NT base、KdDebuggerDataBlock、KTHREAD、虚拟地址读取、断点和单步能力收集实时证据。
 先给出代码级原因和验证方案，再改代码。
 ```
 
@@ -76,25 +76,43 @@ exdi_manager.bat
 - 可以 `u nt!SwapContext`。
 - 可以设置并命中 `bp nt!SwapContext`。
 - 可以单步。
+- 可以定位并返回真实的 `DBGKD_GET_VERSION64`。
+- 可以在 server 内解码 Windows 10 19041 的 `KdDebuggerDataBlock`，不修改目标内存和 DbgEng。
+- `!thread`、`!prcb`、`k` 和 `!process 0 0 System` 可以使用。
+- `$thread` 会读取 `PRCB+8` 的真实 `CurrentThread`，不再把 `PRCB+0` 的 `MxCsr=0x1f80` 当成 KTHREAD。
+- VMware 虚拟内存读取会按 processor 保存 CR3，并单独保存已确认的 kernel CR3。
+- VMware 的 EXDI 对外物理读已接入同一条 `monitor phys` 分块读取路径，`!vtop` 和 `.process /p /r` 可以使用。
+- `.process /p /r <EPROCESS>` 后可以读取目标进程 PEB、loader list、用户模块并执行 `.reload /user`。
 
 ## 仍需继续的问题
 
-主要剩余问题是 `KdDebuggerDataBlock`：
+### VMware system context
+
+VMware monitor 当前只提供 selector、CR0/CR2/CR3/CR4/CR8、GDTR 和 IDTR。它不提供 `fs_base`、`gs_base`、`k_gs_base` 或 MSR 读取，因此 `dg @gs` 仍显示 base 0，`rdmsr` 也得不到真实值。
+
+不要伪造这些寄存器。继续修复前应先确认 VMware 是否存在未记录但可靠的 monitor 接口。
+
+### kdexts PteBase
+
+目标 KDBG 已正确返回 `PteBase=ffffc78000000000`，但当前 WinDbg Preview 的 kdexts `!pte` 仍使用旧的 `fffff68000000000` 基址族，因而会访问不可读的 `fffff6...` 地址。这是 kdexts 内部初始化问题，与 server 的 KDBG 解码和 CR3 页表翻译是两条路径。第三方 `ExdiHelper` 通过进程内 patch 修正它；本项目不采用这种方式。
+
+### `SwapContext` 的 R3 地址空间
+
+KDBG 已提供 `OffsetKThreadApcProcess` 和 `OffsetEprocessDirectoryTableBase`，所以 server 可以取得 `KTHREAD.ApcState.Process` 对应的当前附加进程 CR3。19041 上 `PsGetCurrentProcess` 读取 `KTHREAD+0xb8`，`PsGetCurrentThreadProcess` 读取 owner process `KTHREAD+0x220`。
+
+但是在 `SwapContext` 入口，`PRCB.CurrentThread` 已是 incoming thread，硬件 CR3 和 `rdi` 仍属于 outgoing thread；到函数内部执行 `mov cr3` 后才重新一致。不要让 `ReadVirtualMemory` 自动尝试 current、owner 和硬件多个 CR3，这会在相同用户 VA 存在于多个进程时返回语义错误但表面成功的数据。
+
+需要检查指定进程 R3 时使用：
 
 ```text
-Unable to read debugger data block header
-KdDebuggerDataBlock not available
+.process /p /r <EPROCESS>
+!peb
+.reload /user
 ```
 
-这会影响部分依赖完整 KD debugger data block 的 WinDbg 命令，例如模块链表、部分扩展命令、页表扩展等。
+这条路径依赖 `ReadPhysicalMemoryOrPeriphIO` 正确读取 VMware 物理内存；不要再次把它改回微软原版的通用 PA mode 路径。
 
-后续分析时不要重新推翻 NT base 扫描、VMware monitor 同步、物理读和虚拟地址翻译这些已经验证过的基础能力。应该先查：
-
-- `DBGKD_GET_VERSION64` 返回给 WinDbg 的字段是否完整。
-- `KdVersionBlock` 地址是否正确。
-- WinDbg 读取 debugger data block 时访问的虚拟地址是否被正确翻译。
-- 目标 Windows 版本是否使用编码后的 `KdDebuggerDataBlock`。
-- EXDI server 是否需要补充 WinDbg 期望的 `KDDEBUGGER_DATA64` 相关路径。
+后续分析时不要重新推翻 NT base 扫描、KDBG 解码、VMware monitor 同步、物理读、按 CPU 的 CR3 和虚拟地址翻译这些已经验证过的基础能力。
 
 ## GUI 边界
 
@@ -154,6 +172,10 @@ g
 p
 r
 k
+!vtop <DirectoryTableBase> <virtual-address>
+.process /p /r <EPROCESS>
+!peb
+.reload /user
 ```
 
 ## Git 规则
@@ -163,4 +185,3 @@ k
 - 不要自动 merge upstream。先看官方是否改了 EXDI 相关文件，再决定如何重放本地修改。
 - 不要 push，除非用户明确说 push。
 - 不要向微软发 PR，除非用户明确要求。
-

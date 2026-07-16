@@ -157,6 +157,15 @@ monitor virt
 
 这个细节很重要：曾经一次读取 `1280` 字节 section headers 时，VMware 只返回了部分数据，导致 NT base 扫描误判失败。分块读取后不再依赖单次大包。
 
+内部页表遍历和 EXDI 对外的 `ReadPhysicalMemoryOrPeriphIO` 必须使用同一条 VMware 物理读取路径。只修内部页表遍历时，普通虚拟地址读取虽然可用，但 WinDbg 自己发起的物理页表读取仍会失败，表现为：
+
+```text
+!vtop ...
+PML4E read error 0x8007001E
+```
+
+对外物理读接入 `ReadVMwarePhysicalMemory` 后，`!vtop` 和 `.process /p /r` 均可使用。
+
 ### 4. x64 虚拟内存读
 
 当前 VMware 路径会根据 CR3 手动翻译 x64 虚拟地址：
@@ -244,6 +253,112 @@ Kd=NTBaseAddr,DataBreaks=Exdi
 
 注意：这些配置适合本地维护分支。如果未来真的向微软提交 PR，应避免改变官方默认 `CurrentTarget` 和本地端口，改成文档说明或可选配置。
 
+### 8. KdVersionBlock 和 KdDebuggerDataBlock
+
+Windows 10 19041 的 `KdVersionBlock` 本身可直接读取，但 `KdpDataBlockEncoded=1`，所以目标内存中的 `KdDebuggerDataBlock` 原始字节不是明文 `KDBG`。直接把这段内存交给 DbgEng 会导致：
+
+```text
+Unable to read debugger data block header
+KdDebuggerDataBlock not available
+Module List address is NULL
+```
+
+当前 server 会：
+
+1. 在已确认的 NT `.data` section 中定位 `DBGKD_GET_VERSION64`。
+2. 验证 `KernBase`、`PsLoadedModuleList` 和 `DebuggerDataList`。
+3. 从 `DebuggerDataList` 找到编码的 KDBG。
+4. 使用 list head、`KDBG` owner tag、block size 和 `KernBase` 约束，唯一推导编码旋转量和 key。
+5. 缓存解码后的 block，并只在 EXDI 返回与 KDBG 重叠的内存读取时覆盖返回缓冲区。
+6. 通过 `ReadKdVersionBlock` 返回真实的 `DBGKD_GET_VERSION64`。
+
+这个实现不写目标内存，也不 patch DbgEng 或 kdexts。Windows 10 19041 实机验证值为：
+
+```text
+KdVersionBlock       = fffff8005e80f3a0
+DebuggerDataList     = fffff8005e8406b0
+KdDebuggerDataBlock = fffff8005e800b20
+OwnerTag / Size      = KDBG / 0x380
+KernBase             = fffff8005dc00000
+```
+
+### 9. KTHREAD 与按 CPU 的 CR3
+
+原来的 `Unable to read KTHREAD address 0000000000001f80` 不是 NT base 扫描错误。实时证据表明：
+
+```text
+PRCB+0 = MxCsr 0x1f80，加上相邻的 processor metadata
+PRCB+8 = CurrentThread
+```
+
+KDBG 不可用时，DbgEng 没有取得 `OffsetPrcbCurrentThread=8`，实际按偏移 0 读取，于是把 `MxCsr=0x1f80` 当成 KTHREAD 地址。KDBG 修复后：
+
+```text
+$thread == poi(@$prcb+8)
+```
+
+并且 `!thread`、`!prcb` 和 `k` 在 `nt!KiPageFault` 断点上均可正常工作。
+
+VMware 虚拟地址读取也不再使用一个全局 `m_lastCr3`。当前实现按 processor 保存最近的 CR3，并在 ring 0 context 中更新独立的 kernel CR3。`~Ns` 切换 processor 后，寄存器、PCR、PRCB、KTHREAD 和 CR3 会随 processor context 同步。
+
+### 10. R3 地址空间与 `SwapContext`
+
+Windows 10 19041 的现场反汇编确认：
+
+```text
+PsGetCurrentProcess:
+    mov rax, gs:[188h]
+    mov rax, [rax+0B8h]
+
+PsGetCurrentThreadProcess:
+    mov rax, gs:[188h]
+    mov rax, [rax+220h]
+```
+
+因此 `KTHREAD+0xb8` 是 `ApcState.Process`，表示当前附加进程；`KTHREAD+0x220` 是 owner process。server 不需要硬编码当前附加进程相关的结构偏移，解码后的 KDBG 已提供：
+
+```text
+KiProcessorBlock
+OffsetPrcbCurrentThread              = 0x8
+OffsetKThreadApcProcess              = 0xb8
+OffsetEprocessDirectoryTableBase     = 0x28
+```
+
+可以沿以下路径得到 WinDbg 当前逻辑线程的附加进程 CR3：
+
+```text
+KiProcessorBlock[cpu]
+  -> PRCB.CurrentThread
+  -> KTHREAD.ApcState.Process
+  -> EPROCESS.DirectoryTableBase
+```
+
+但这不能直接替换硬件 CR3。`SwapContext` 入口存在正常的调度器过渡窗口：`PRCB.CurrentThread` 和 `rsi` 已指向 incoming KTHREAD，而硬件 CR3 及 `rdi` 仍属于 outgoing KTHREAD。函数稍后从 incoming `ApcState.Process` 读取 `DirectoryTableBase`，到 `SwapContext+0x3de` 才执行 `mov cr3, rcx`。
+
+此时同一个 EXDI `ReadVirtualMemory(Address, Size)` 调用无法区分 WinDbg 是要读取 incoming PEB，还是要展开 outgoing 用户栈。自动尝试多个 CR3 会在相同用户 VA 同时存在于两个进程时静默返回错误进程的数据，因此当前实现不采用 CR3 猜测或 fallback。
+
+正确做法是保留硬件 CR3 作为处理器执行地址空间，并通过 WinDbg 显式选择需要检查的进程：
+
+```text
+.process /p /r <EPROCESS>
+!peb
+.reload /user
+```
+
+部署后现场验证：
+
+```text
+!vtop 13b130000 ed64d66000
+Virtual address ed64d66000 translates to physical address 13804e000.
+
+.process /p /r ffffa28c2ee31080
+Implicit process is now ffffa28c`2ee31080
+.cache forcedecodeuser done
+Loading User Symbols
+```
+
+随后 `db <PEB>`、`!peb` 和 `lm u` 均能完整读取 WmiPrvSE 的 PEB、loader list 与用户模块。在 `SwapContext` 的 incoming `csrss.exe` 上重复 `.process /p /r` 也能读取其 PEB 和模块链。由此确认原来的 `.process` 失败来自 EXDI 对外物理读取路径缺失，不是 Windows 没有提供当前进程信息。
+
 ## 部署方式
 
 构建后手动复制：
@@ -317,6 +432,8 @@ VMware 专用日志：
 ```text
 ntbase scan source=idt
 ntbase found
+KdVersionBlock found
+KdDebuggerDataBlock decoded
 VMware physical read bad reply
 ReadVirtualMemory short read
 ```
@@ -325,37 +442,39 @@ ReadVirtualMemory short read
 
 - `ntbase scan source=idt`：正在从 IDT handler 向下扫描 NT base。
 - `ntbase found`：已找到内核基址。
+- `KdVersionBlock found`：已定位并验证 `DBGKD_GET_VERSION64`。
+- `KdDebuggerDataBlock decoded`：已唯一推导编码参数并缓存明文 KDBG。
 - `VMware physical read bad reply`：物理读返回长度或格式不符合预期。
 - `ReadVirtualMemory short read`：页表翻译或物理读失败，WinDbg 可能显示 `??`。
 
 ## 已知未完成项
 
-### KdDebuggerDataBlock
+### GS base 和 MSR
 
-当前核心调试能力已经可用，但 `KdDebuggerDataBlock` 仍未解码。
-
-可能仍看到：
+VMware monitor 的 `help r` 只列出 selector、CR0/CR2/CR3/CR4、GDTR、IDTR 和 LDTR 等寄存器，没有 `fs_base`、`gs_base`、`k_gs_base` 或通用 MSR 接口。当前表现为：
 
 ```text
-Unable to read debugger data block header
-Unable to read KTHREAD address ...
-!pte -> Unknown platform 0
+dg @gs       -> base 0
+rdmsr ...    -> 无真实值
 ```
 
-影响范围：
+这不是当前 KTHREAD 问题的原因；KTHREAD 已通过 KDBG 中的 PRCB offset 修复。除非能确认 VMware 存在可靠接口，否则不应伪造这些值。
 
-- `!pte`
-- `!process 0 0`
-- 部分 kdexts
-- 更完整的内核数据结构枚举
+### kdexts PteBase
 
-下一步建议优先做 server 侧修复：
+KDBG 中的真实 `PteBase` 已解码为：
 
-- 找到 `KdVersionBlock` / `DebuggerDataList`。
-- 在 EXDI server 内解码 `KdDebuggerDataBlock`。
-- 通过 `ReadKdVersionBlock` 或 DbgEng 实际读取路径提供正确数据。
+```text
+ffffc78000000000
+```
 
-不要直接部署未经审计的第三方 WinDbg 扩展 DLL。
+但当前 WinDbg Preview 的 kdexts `!pte` 仍使用旧的 `fffff68000000000` 基址族，并尝试读取不可用的 `fffff6...` 地址。这是 kdexts 自己维护的 PteBase 状态，不是 EXDI server 返回的 KDBG 内容错误。
+
+第三方 `ExdiHelper` 通过扫描并修改 kdexts 进程内变量解决该问题。本 fork 不部署未经审计的第三方 DLL，也不在 server 中 patch WinDbg 进程。
+
+### 部分扩展命令
+
+`!process 0 0 System`、`!thread`、`!prcb`、`k` 和模块枚举已经可用。`!vm 1` 可以返回主要统计，但仍可能报告个别 symbol/global 无法读取；这类问题需要按具体命令继续区分 kdexts 内部假设、缺失 system context 和真实页表读取限制。
 
 ## WinDbg Preview 更新风险
 
@@ -379,7 +498,9 @@ Unable to read KTHREAD address ...
 
 - 记录验证过的 WinDbg 版本。
 - 更新 WinDbg 后先验证 `u nt!SwapContext`、`bp/g/p`。
-- KDBG 修复完成后额外验证 `!pte`、`!process 0 0`。
+- 验证 `dq nt!KdDebuggerDataBlock L4` 返回 `KDBG/0x380`。
+- 验证 `$thread == poi(@$prcb+8)`、`!thread`、`!prcb` 和 `!process 0 0 System`。
+- 将 `!pte` 单独视为 kdexts PteBase 问题，不要据此否定 server 的 KDBG 修复。
 
 ## 同步上游
 
@@ -401,4 +522,3 @@ git rebase master
 ```
 
 如遇冲突，优先保护 VMware EXDI 修复逻辑，再重新构建验证。
-

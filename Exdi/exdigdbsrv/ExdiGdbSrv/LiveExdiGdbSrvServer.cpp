@@ -29,6 +29,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <intrin.h>
 
 #define METHOD_NOT_IMPLEMENTED if (IsDebuggerPresent()) \
                                    __debugbreak(); \
@@ -876,6 +877,323 @@ namespace
 
         return FindNtBaseAddressFromIdt(pController, currentContext.IDTBase, currentContext.RegCr3, ntBaseAddress);
     }
+
+    struct KdVersionBlock64
+    {
+        USHORT MajorVersion;
+        USHORT MinorVersion;
+        UCHAR ProtocolVersion;
+        UCHAR KdSecondaryVersion;
+        USHORT Flags;
+        USHORT MachineType;
+        UCHAR MaxPacketType;
+        UCHAR MaxStateChange;
+        UCHAR MaxManipulate;
+        UCHAR Simulation;
+        USHORT Unused;
+        ULONGLONG KernBase;
+        ULONGLONG PsLoadedModuleList;
+        ULONGLONG DebuggerDataList;
+    };
+
+    struct DebugDataHeader64
+    {
+        ULONGLONG Flink;
+        ULONGLONG Blink;
+        ULONG OwnerTag;
+        ULONG Size;
+    };
+
+    struct ListEntry64
+    {
+        ULONGLONG Flink;
+        ULONGLONG Blink;
+    };
+
+    struct WindowsDebuggerData
+    {
+        ADDRESS_TYPE versionAddress;
+        KdVersionBlock64 version;
+        ADDRESS_TYPE debuggerDataAddress;
+        std::vector<BYTE> decodedDebuggerData;
+    };
+
+    static_assert(sizeof(KdVersionBlock64) == 0x28, "Unexpected DBGKD_GET_VERSION64 layout");
+    static_assert(sizeof(DebugDataHeader64) == 0x18, "Unexpected DBGKD_DEBUG_DATA_HEADER64 layout");
+
+    constexpr USHORT kdMajorVersionNt = 0x000f;
+    constexpr UCHAR kdProtocolVersion = 6;
+    constexpr ULONG kdDebuggerDataOwnerTag = 0x4742444b; // 'KDBG'
+    constexpr ULONGLONG minimumKernelAddress = 0xffff800000000000ULL;
+
+    bool IsCanonicalKernelAddress(_In_ ULONGLONG address)
+    {
+        return address >= minimumKernelAddress;
+    }
+
+    ULONGLONG RotateLeft64(_In_ ULONGLONG value, _In_ unsigned shift)
+    {
+        shift &= 63;
+        return shift == 0 ? value : ((value << shift) | (value >> (64 - shift)));
+    }
+
+    ULONGLONG DecodeDebuggerDataQword(
+        _In_ ULONGLONG encodedValue,
+        _In_ unsigned rotation,
+        _In_ ULONGLONG key)
+    {
+        return _byteswap_uint64(RotateLeft64(encodedValue, rotation)) ^ key;
+    }
+
+    bool TryFindKdVersionBlock(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE ntBaseAddress,
+        _In_ ADDRESS_TYPE cr3,
+        _Out_ ADDRESS_TYPE* versionAddress,
+        _Out_ KdVersionBlock64* version)
+    {
+        IMAGE_DOS_HEADER dosHeader = {};
+        if (!ReadTargetVirtualMemory(pController, cr3, ntBaseAddress, &dosHeader, sizeof(dosHeader)) ||
+            dosHeader.e_magic != IMAGE_DOS_SIGNATURE ||
+            dosHeader.e_lfanew <= 0 ||
+            dosHeader.e_lfanew >= 0x100000)
+        {
+            return false;
+        }
+
+        IMAGE_NT_HEADERS64 ntHeaders = {};
+        const ADDRESS_TYPE ntHeadersAddress = ntBaseAddress + dosHeader.e_lfanew;
+        if (!ReadTargetVirtualMemory(pController, cr3, ntHeadersAddress, &ntHeaders, sizeof(ntHeaders)) ||
+            ntHeaders.Signature != IMAGE_NT_SIGNATURE ||
+            ntHeaders.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+            ntHeaders.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        {
+            return false;
+        }
+
+        const DWORD sectionCount = (std::min)(static_cast<DWORD>(ntHeaders.FileHeader.NumberOfSections), static_cast<DWORD>(32));
+        std::vector<IMAGE_SECTION_HEADER> sections(sectionCount);
+        const ADDRESS_TYPE sectionHeadersAddress =
+            ntHeadersAddress + FIELD_OFFSET(IMAGE_NT_HEADERS64, OptionalHeader) + ntHeaders.FileHeader.SizeOfOptionalHeader;
+        if (sectionCount == 0 ||
+            !ReadTargetVirtualMemory(pController, cr3, sectionHeadersAddress, sections.data(), sections.size() * sizeof(IMAGE_SECTION_HEADER)))
+        {
+            return false;
+        }
+
+        for (const IMAGE_SECTION_HEADER& section : sections)
+        {
+            static const BYTE dataSectionName[] = { '.', 'd', 'a', 't', 'a', 0 };
+            if (memcmp(section.Name, dataSectionName, sizeof(dataSectionName)) != 0)
+            {
+                continue;
+            }
+
+            constexpr DWORD maximumDataSectionSize = 0x02000000;
+            const DWORD dataSize = section.Misc.VirtualSize;
+            if (dataSize < sizeof(KdVersionBlock64) || dataSize > maximumDataSectionSize)
+            {
+                return false;
+            }
+
+            const ADDRESS_TYPE dataAddress = ntBaseAddress + section.VirtualAddress;
+            std::vector<BYTE> data(dataSize);
+            if (!ReadTargetVirtualMemory(pController, cr3, dataAddress, data.data(), data.size()))
+            {
+                AppendVMwareLog("failed to read nt .data address=%I64x size=%x\n",
+                    static_cast<ULONGLONG>(dataAddress),
+                    dataSize);
+                return false;
+            }
+
+            for (size_t offset = 0; offset + sizeof(KdVersionBlock64) <= data.size(); offset += sizeof(ULONGLONG))
+            {
+                KdVersionBlock64 candidate = {};
+                memcpy(&candidate, data.data() + offset, sizeof(candidate));
+                if (candidate.MajorVersion != kdMajorVersionNt ||
+                    candidate.ProtocolVersion != kdProtocolVersion ||
+                    candidate.MachineType != IMAGE_FILE_MACHINE_AMD64 ||
+                    candidate.KernBase != ntBaseAddress ||
+                    !IsCanonicalKernelAddress(candidate.PsLoadedModuleList) ||
+                    !IsCanonicalKernelAddress(candidate.DebuggerDataList))
+                {
+                    continue;
+                }
+
+                ListEntry64 debuggerDataList = {};
+                if (!ReadTargetVirtualMemory(
+                        pController,
+                        cr3,
+                        candidate.DebuggerDataList,
+                        &debuggerDataList,
+                        sizeof(debuggerDataList)) ||
+                    !IsCanonicalKernelAddress(debuggerDataList.Flink) ||
+                    !IsCanonicalKernelAddress(debuggerDataList.Blink))
+                {
+                    continue;
+                }
+
+                *versionAddress = dataAddress + offset;
+                *version = candidate;
+                AppendVMwareLog(
+                    "KdVersionBlock found address=%I64x build=%u kern=%I64x modules=%I64x dataList=%I64x\n",
+                    static_cast<ULONGLONG>(*versionAddress),
+                    candidate.MinorVersion,
+                    candidate.KernBase,
+                    candidate.PsLoadedModuleList,
+                    candidate.DebuggerDataList);
+                return true;
+            }
+
+            return false;
+        }
+
+        return false;
+    }
+
+    bool TryDecodeKdDebuggerData(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE cr3,
+        _In_ const KdVersionBlock64& version,
+        _Out_ ADDRESS_TYPE* debuggerDataAddress,
+        _Out_ std::vector<BYTE>* decodedDebuggerData)
+    {
+        ListEntry64 debuggerDataList = {};
+        if (!ReadTargetVirtualMemory(
+                pController,
+                cr3,
+                version.DebuggerDataList,
+                &debuggerDataList,
+                sizeof(debuggerDataList)) ||
+            !IsCanonicalKernelAddress(debuggerDataList.Flink))
+        {
+            return false;
+        }
+
+        constexpr size_t probeSize = sizeof(ULONGLONG) * 4;
+        BYTE encodedProbe[probeSize] = {};
+        if (!ReadTargetVirtualMemory(
+                pController,
+                cr3,
+                debuggerDataList.Flink,
+                encodedProbe,
+                sizeof(encodedProbe)))
+        {
+            return false;
+        }
+
+        ULONGLONG encodedQwords[probeSize / sizeof(ULONGLONG)] = {};
+        memcpy(encodedQwords, encodedProbe, sizeof(encodedQwords));
+
+        unsigned matchingRotation = 0;
+        ULONGLONG matchingKey = 0;
+        ULONG debuggerDataSize = 0;
+        bool foundEncoding = false;
+        for (unsigned rotation = 0; rotation < 64; ++rotation)
+        {
+            const ULONGLONG key =
+                _byteswap_uint64(RotateLeft64(encodedQwords[1], rotation)) ^ version.DebuggerDataList;
+            const ULONGLONG decodedTagAndSize = DecodeDebuggerDataQword(encodedQwords[2], rotation, key);
+            const ULONG ownerTag = static_cast<ULONG>(decodedTagAndSize);
+            const ULONG size = static_cast<ULONG>(decodedTagAndSize >> 32);
+            const ULONGLONG kernBase = DecodeDebuggerDataQword(encodedQwords[3], rotation, key);
+            if (ownerTag == kdDebuggerDataOwnerTag &&
+                size >= sizeof(DebugDataHeader64) &&
+                size <= 0x10000 &&
+                kernBase == version.KernBase)
+            {
+                if (foundEncoding)
+                {
+                    AppendVMwareLog("ambiguous KdDebuggerDataBlock encoding\n");
+                    return false;
+                }
+
+                matchingRotation = rotation;
+                matchingKey = key;
+                debuggerDataSize = size;
+                foundEncoding = true;
+            }
+        }
+
+        if (!foundEncoding)
+        {
+            AppendVMwareLog("failed to derive KdDebuggerDataBlock encoding address=%I64x\n",
+                debuggerDataList.Flink);
+            return false;
+        }
+
+        const size_t encodedSize = (static_cast<size_t>(debuggerDataSize) + sizeof(ULONGLONG) - 1) &
+                                   ~(sizeof(ULONGLONG) - 1);
+        std::vector<BYTE> encodedData(encodedSize);
+        if (!ReadTargetVirtualMemory(
+                pController,
+                cr3,
+                debuggerDataList.Flink,
+                encodedData.data(),
+                encodedData.size()))
+        {
+            return false;
+        }
+
+        std::vector<BYTE> decodedData(encodedSize);
+        for (size_t offset = 0; offset < encodedSize; offset += sizeof(ULONGLONG))
+        {
+            ULONGLONG encodedValue = 0;
+            memcpy(&encodedValue, encodedData.data() + offset, sizeof(encodedValue));
+            const ULONGLONG decodedValue = DecodeDebuggerDataQword(encodedValue, matchingRotation, matchingKey);
+            memcpy(decodedData.data() + offset, &decodedValue, sizeof(decodedValue));
+        }
+        decodedData.resize(debuggerDataSize);
+
+        DebugDataHeader64 decodedHeader = {};
+        memcpy(&decodedHeader, decodedData.data(), sizeof(decodedHeader));
+        ULONGLONG decodedKernBase = 0;
+        memcpy(&decodedKernBase, decodedData.data() + sizeof(decodedHeader), sizeof(decodedKernBase));
+        if (decodedHeader.Blink != version.DebuggerDataList ||
+            decodedHeader.OwnerTag != kdDebuggerDataOwnerTag ||
+            decodedHeader.Size != debuggerDataSize ||
+            decodedKernBase != version.KernBase)
+        {
+            return false;
+        }
+
+        *debuggerDataAddress = debuggerDataList.Flink;
+        *decodedDebuggerData = std::move(decodedData);
+        AppendVMwareLog(
+            "KdDebuggerDataBlock decoded address=%I64x size=%x rotation=%u key=%I64x\n",
+            static_cast<ULONGLONG>(*debuggerDataAddress),
+            debuggerDataSize,
+            matchingRotation,
+            matchingKey);
+        return true;
+    }
+
+    bool TryLoadWindowsDebuggerData(
+        _In_ GdbSrvController* pController,
+        _In_ ADDRESS_TYPE ntBaseAddress,
+        _In_ ADDRESS_TYPE cr3,
+        _Out_ WindowsDebuggerData* debuggerData)
+    {
+        WindowsDebuggerData result = {};
+        if (!TryFindKdVersionBlock(
+                pController,
+                ntBaseAddress,
+                cr3,
+                &result.versionAddress,
+                &result.version) ||
+            !TryDecodeKdDebuggerData(
+                pController,
+                cr3,
+                result.version,
+                &result.debuggerDataAddress,
+                &result.decodedDebuggerData))
+        {
+            return false;
+        }
+
+        *debuggerData = std::move(result);
+        return true;
+    }
 }
 
 //=============================================================================
@@ -1322,6 +1640,102 @@ static HRESULT SafeArrayFromByteArray(_In_reads_bytes_(arraySize) const char *pB
     return S_OK;
 }
 
+ADDRESS_TYPE CLiveExdiGdbSrvServer::GetVMwareCr3(_In_ ADDRESS_TYPE virtualAddress)
+{
+    if (IsCanonicalKernelAddress(virtualAddress) && m_kernelCr3 != 0)
+    {
+        return m_kernelCr3;
+    }
+
+    AsynchronousGdbSrvController* const pController = GetGdbSrvController();
+    if (pController == nullptr)
+    {
+        return 0;
+    }
+
+    const unsigned activeProcessor = pController->GetLastKnownActiveCpu();
+    if (activeProcessor < m_processorCr3.size())
+    {
+        return m_processorCr3[activeProcessor];
+    }
+
+    return 0;
+}
+
+void CLiveExdiGdbSrvServer::OverlayKdDebuggerData(
+    _In_ ADDRESS_TYPE address,
+    _Inout_updates_bytes_(size) void* data,
+    _In_ size_t size) const
+{
+    if (data == nullptr || size == 0 || m_decodedKdDebuggerData.empty())
+    {
+        return;
+    }
+
+    const ADDRESS_TYPE blockAddress = m_kdDebuggerDataAddress;
+    size_t bufferOffset = 0;
+    size_t blockOffset = 0;
+    if (address < blockAddress)
+    {
+        const ULONGLONG distance = blockAddress - address;
+        if (distance >= size)
+        {
+            return;
+        }
+        bufferOffset = static_cast<size_t>(distance);
+    }
+    else
+    {
+        const ULONGLONG distance = address - blockAddress;
+        if (distance >= m_decodedKdDebuggerData.size())
+        {
+            return;
+        }
+        blockOffset = static_cast<size_t>(distance);
+    }
+
+    const size_t bytesToCopy = (std::min)(
+        size - bufferOffset,
+        m_decodedKdDebuggerData.size() - blockOffset);
+    memcpy(
+        static_cast<BYTE*>(data) + bufferOffset,
+        m_decodedKdDebuggerData.data() + blockOffset,
+        bytesToCopy);
+}
+
+HRESULT CLiveExdiGdbSrvServer::InitializeWindowsDebuggerData(
+    _In_ AsynchronousGdbSrvController* pController,
+    _In_ ADDRESS_TYPE ntBaseAddress,
+    _In_ ADDRESS_TYPE cr3)
+{
+    if (m_ntBaseAddress == ntBaseAddress &&
+        !m_kdVersionBlock.empty() &&
+        !m_decodedKdDebuggerData.empty())
+    {
+        return S_OK;
+    }
+
+    WindowsDebuggerData debuggerData = {};
+    if (!TryLoadWindowsDebuggerData(pController, ntBaseAddress, cr3, &debuggerData))
+    {
+        m_ntBaseAddress = 0;
+        m_kdVersionBlock.clear();
+        m_kdDebuggerDataAddress = 0;
+        m_decodedKdDebuggerData.clear();
+        AppendVMwareLog("Windows debugger data initialization failed nt=%I64x cr3=%I64x\n",
+            static_cast<ULONGLONG>(ntBaseAddress),
+            static_cast<ULONGLONG>(cr3));
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+
+    const BYTE* const versionBytes = reinterpret_cast<const BYTE*>(&debuggerData.version);
+    m_ntBaseAddress = ntBaseAddress;
+    m_kdVersionBlock.assign(versionBytes, versionBytes + sizeof(debuggerData.version));
+    m_kdDebuggerDataAddress = debuggerData.debuggerDataAddress;
+    m_decodedKdDebuggerData = std::move(debuggerData.decodedDebuggerData);
+    return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::ReadVirtualMemory(
     /* [in] */ ADDRESS_TYPE Address,
     /* [in] */ DWORD dwBytesToRead,
@@ -1339,14 +1753,19 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::ReadVirtualMemory(
 
         if (IsCurrentTargetVMware())
         {
-            ADDRESS_TYPE cr3 = m_lastCr3;
+            ADDRESS_TYPE cr3 = GetVMwareCr3(Address);
             if (cr3 == 0)
             {
                 CONTEXT_X86_64 currentContext = {};
-                HRESULT contextResult = GetContextEx(0, &currentContext);
+                unsigned activeProcessor = pController->GetLastKnownActiveCpu();
+                if (activeProcessor == C_ALLCORES)
+                {
+                    activeProcessor = 0;
+                }
+                HRESULT contextResult = GetContextEx(activeProcessor, &currentContext);
                 if (contextResult == S_OK)
                 {
-                    cr3 = currentContext.RegCr3;
+                    cr3 = GetVMwareCr3(Address);
                 }
             }
 
@@ -1355,6 +1774,7 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::ReadVirtualMemory(
                 SimpleCharBuffer translatedBuffer;
                 if (ReadTargetVirtualMemoryBuffer(pController, cr3, Address, dwBytesToRead, &translatedBuffer))
                 {
+                    OverlayKdDebuggerData(Address, translatedBuffer.GetInternalBuffer(), translatedBuffer.GetLength());
                     return SafeArrayFromByteArray(translatedBuffer.GetInternalBuffer(), translatedBuffer.GetLength(), pbReadBuffer);
                 }
 
@@ -1367,6 +1787,7 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::ReadVirtualMemory(
         }
 
         SimpleCharBuffer buffer = pController->ReadMemory(Address, dwBytesToRead, memType);
+        OverlayKdDebuggerData(Address, buffer.GetInternalBuffer(), buffer.GetLength());
         return SafeArrayFromByteArray(buffer.GetInternalBuffer(), buffer.GetLength(), pbReadBuffer);
     }
     CATCH_AND_RETURN_HRESULT;
@@ -1426,6 +1847,35 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::ReadPhysicalMemoryOrPeriphIO(
         if (pReadBuffer == nullptr || pController == nullptr)
         {
             return E_POINTER;
+        }
+
+        if (IsCurrentTargetVMware())
+        {
+            SimpleCharBuffer buffer;
+            if (!buffer.TryEnsureCapacity(dwBytesToRead))
+            {
+                return E_OUTOFMEMORY;
+            }
+
+            buffer.SetLength(dwBytesToRead);
+            if (dwBytesToRead != 0 &&
+                !ReadVMwarePhysicalMemory(
+                    pController,
+                    Address,
+                    buffer.GetInternalBuffer(),
+                    dwBytesToRead))
+            {
+                AppendVMwareLog(
+                    "ReadPhysicalMemory short read pa=%I64x size=%x\n",
+                    static_cast<ULONGLONG>(Address),
+                    dwBytesToRead);
+                return SafeArrayFromByteArray("", 0, pReadBuffer);
+            }
+
+            return SafeArrayFromByteArray(
+                buffer.GetInternalBuffer(),
+                buffer.GetLength(),
+                pReadBuffer);
         }
 
         memoryAccessType memoryType = {0};
@@ -1578,6 +2028,7 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::Ioctl(
                     hr = FindNtBaseAddressFromContext(pController, currentContext, &ntBaseAddress);
                     if (hr == S_OK)
                     {
+                        (void)InitializeWindowsDebuggerData(pController, ntBaseAddress, currentContext.RegCr3);
                         hr = SafeArrayFromByteArray(reinterpret_cast<const char*>(&ntBaseAddress), sizeof(ntBaseAddress), pOutputBuffer);
                     }
                 }
@@ -1617,14 +2068,19 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::Ioctl(
 
                     if (IsCurrentTargetVMware())
                     {
-                        ADDRESS_TYPE cr3 = m_lastCr3;
+                        ADDRESS_TYPE cr3 = GetVMwareCr3(pSpecialRegs->address);
                         if (cr3 == 0)
                         {
                             CONTEXT_X86_64 currentContext = {};
-                            HRESULT contextResult = GetContextEx(0, &currentContext);
+                            unsigned activeProcessor = pController->GetLastKnownActiveCpu();
+                            if (activeProcessor == C_ALLCORES)
+                            {
+                                activeProcessor = 0;
+                            }
+                            HRESULT contextResult = GetContextEx(activeProcessor, &currentContext);
                             if (contextResult == S_OK)
                             {
-                                cr3 = currentContext.RegCr3;
+                                cr3 = GetVMwareCr3(pSpecialRegs->address);
                             }
                         }
 
@@ -1633,6 +2089,10 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::Ioctl(
                             SimpleCharBuffer translatedBuffer;
                             if (ReadTargetVirtualMemoryBuffer(pController, cr3, pSpecialRegs->address, pSpecialRegs->bytesToRead, &translatedBuffer))
                             {
+                                OverlayKdDebuggerData(
+                                    pSpecialRegs->address,
+                                    translatedBuffer.GetInternalBuffer(),
+                                    translatedBuffer.GetLength());
                                 hr = SafeArrayFromByteArray(translatedBuffer.GetInternalBuffer(), translatedBuffer.GetLength(), pOutputBuffer);
                                 break;
                             }
@@ -1707,9 +2167,50 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::ReadKdVersionBlock(
         /* [in] */ DWORD dwBufferSize,
         /* [out] */ SAFEARRAY * *pKdVersionBlockBuffer)
 {
-    UNREFERENCED_PARAMETER(dwBufferSize);
-    UNREFERENCED_PARAMETER(pKdVersionBlockBuffer);
-    return E_NOTIMPL;
+    if (pKdVersionBlockBuffer == nullptr)
+    {
+        return E_POINTER;
+    }
+    if (dwBufferSize == 0)
+    {
+        return E_INVALIDARG;
+    }
+    if (m_kdVersionBlock.empty())
+    {
+        AsynchronousGdbSrvController* const pController = GetGdbSrvController();
+        if (pController == nullptr)
+        {
+            return E_POINTER;
+        }
+
+        CONTEXT_X86_64 currentContext = {};
+        HRESULT result = GetContextEx(0, &currentContext);
+        if (FAILED(result))
+        {
+            return result;
+        }
+
+        ADDRESS_TYPE ntBaseAddress = 0;
+        result = FindNtBaseAddressFromContext(pController, currentContext, &ntBaseAddress);
+        if (FAILED(result))
+        {
+            return result;
+        }
+
+        result = InitializeWindowsDebuggerData(pController, ntBaseAddress, currentContext.RegCr3);
+        if (FAILED(result))
+        {
+            return result;
+        }
+    }
+
+    const size_t bytesToCopy = (std::min)(
+        static_cast<size_t>(dwBufferSize),
+        m_kdVersionBlock.size());
+    return SafeArrayFromByteArray(
+        reinterpret_cast<const char*>(m_kdVersionBlock.data()),
+        bytesToCopy,
+        pKdVersionBlockBuffer);
 }
 
 HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::ReadMSR(
@@ -2122,8 +2623,19 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::GetContextEx(_In_ DWORD process
             pContext->RegCr4 = GdbSrvController::ParseRegisterValue(registers["cr4"]);
             pContext->RegCr8 = GdbSrvController::ParseRegisterValue(registers["cr8"]);
             pContext->RegGroupSelection.fSystemRegisters = TRUE;
-            m_lastCr3 = pContext->RegCr3;
-            m_lastCr4 = pContext->RegCr4;
+            constexpr DWORD maximumTrackedProcessors = 256;
+            if (processorNumber < maximumTrackedProcessors)
+            {
+                if (m_processorCr3.size() <= processorNumber)
+                {
+                    m_processorCr3.resize(processorNumber + 1);
+                }
+                m_processorCr3[processorNumber] = pContext->RegCr3;
+            }
+            if ((pContext->SegCs & 3) == 0 && pContext->RegCr3 != 0)
+            {
+                m_kernelCr3 = pContext->RegCr3;
+            }
         }
 
         //  Get all floating point registers (FPU)
@@ -2256,6 +2768,20 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::SetContextEx(_In_ DWORD process
             registers["cr8"] = pContext->RegCr8;
         }
         pController->SetRegisters(processorNumber, registers, false);
+        if (pContext->RegGroupSelection.fSystemRegisters && processorNumber < 256)
+        {
+            if (m_processorCr3.size() <= processorNumber)
+            {
+                m_processorCr3.resize(processorNumber + 1);
+            }
+            m_processorCr3[processorNumber] = pContext->RegCr3;
+            if (pContext->RegGroupSelection.fSegmentRegs &&
+                (pContext->SegCs & 3) == 0 &&
+                pContext->RegCr3 != 0)
+            {
+                m_kernelCr3 = pContext->RegCr3;
+            }
+        }
         registers.clear();
 
         //  Floating point registers
