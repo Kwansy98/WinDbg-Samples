@@ -14,8 +14,8 @@
 #pragma once
 #include "resource.h"
 #include "ExdiGdbSrv.h"
-#include "InterfaceMarshalHelper.h"
 #include "GdbSrvControllerLib.h"
+#include <array>
 #include <string>
 #include <memory>
 #include <vector>
@@ -50,13 +50,9 @@ class ATL_NO_VTABLE CLiveExdiGdbSrvServer :
     public IeXdiControlComponentFunctions
 {
 public:
-	CLiveExdiGdbSrvServer(): 
+	CLiveExdiGdbSrvServer():
 	      m_pGdbSrvController(nullptr),
 	      m_detectedProcessorFamily(PROCESSOR_FAMILY_UNK),
-          m_pSelfReferenceForNotificationThread(nullptr),
-          m_notificationThread(nullptr),
-          m_notificationSemaphore(nullptr),
-          m_terminating(false),
           m_lastResumingCommandWasStep(false),
           m_targetIsRunning(false),
           m_timerId(0),
@@ -65,6 +61,10 @@ public:
           m_fEnableSSEContext(false),
           m_lastPcAddress(0),
           m_lastPSRvalue(0),
+          m_virtualAmd64DataBreakpoints{},
+          m_lastHitAmd64DataBreakpoint{},
+          m_lastHitAmd64DebugRegisterNumber(4),
+          m_lastHitAmd64ProcessorNumber(static_cast<DWORD>(-1)),
           m_kernelCr3(0),
           m_ntBaseAddress(0),
           m_kdDebuggerDataAddress(0),
@@ -75,7 +75,8 @@ public:
 
     ~CLiveExdiGdbSrvServer()
     {
-        assert(m_terminating);
+        assert(m_timerId == 0);
+        assert(m_pGdbSrvController == nullptr);
     }
 
 DECLARE_REGISTRY_RESOURCEID(IDR_LIVEEXDIGDBSRVSERVER)
@@ -287,13 +288,28 @@ public:
     virtual HRESULT STDMETHODCALLTYPE PerformKeepaliveChecks(void);
 
     private:
+        struct VirtualAmd64DataBreakpoint
+        {
+            bool active;
+            unsigned controllerBreakpointNumber;
+            ADDRESS_TYPE address;
+            BYTE accessWidth;
+            DATA_ACCESS_TYPE accessType;
+        };
+
+        struct Amd64SystemRegisters
+        {
+            bool valid;
+            DWORD64 cr0;
+            DWORD64 cr2;
+            DWORD64 cr3;
+            DWORD64 cr4;
+            DWORD64 cr8;
+        };
+
         GdbSrvControllerLib::AsynchronousGdbSrvController * m_pGdbSrvController;
         DWORD m_detectedProcessorFamily;
         CComPtr<IeXdiClientNotifyRunChg3> m_pRunNotificationListener;
-        InterfaceMarshalHelper<IAsynchronousCommandNotificationReceiver> * m_pSelfReferenceForNotificationThread;
-        HANDLE m_notificationThread;
-        HANDLE m_notificationSemaphore;
-        bool m_terminating;
         bool m_lastResumingCommandWasStep;
         bool m_targetIsRunning;
         UINT_PTR m_timerId;
@@ -303,7 +319,12 @@ public:
         bool m_fEnableSSEContext;
         ADDRESS_TYPE m_lastPcAddress;
         DWORD64 m_lastPSRvalue;
+        std::array<VirtualAmd64DataBreakpoint, 4> m_virtualAmd64DataBreakpoints;
+        VirtualAmd64DataBreakpoint m_lastHitAmd64DataBreakpoint;
+        unsigned m_lastHitAmd64DebugRegisterNumber;
+        DWORD m_lastHitAmd64ProcessorNumber;
         std::vector<ADDRESS_TYPE> m_processorCr3;
+        std::vector<Amd64SystemRegisters> m_amd64SystemRegisters;
         ADDRESS_TYPE m_kernelCr3;
         ADDRESS_TYPE m_ntBaseAddress;
         std::vector<BYTE> m_kdVersionBlock;
@@ -313,6 +334,17 @@ public:
         bool m_RequireMemoryAccessByPA;
 
         inline GdbSrvControllerLib::AsynchronousGdbSrvController * GetGdbSrvController() {return m_pGdbSrvController;}
+        void ClearLastAmd64DataBreakpointHit();
+        bool RecordAmd64DataBreakpointHit(
+            _In_ ADDRESS_TYPE reportedAddress,
+            _In_ DWORD processorNumber);
+        void PopulateAmd64DebugRegisters(
+            _In_ DWORD processorNumber,
+            _Out_ PCONTEXT_X86_64 pContext) const;
+        void SynchronizeAmd64DebugRegisters(
+            _In_ const CONTEXT_X86_64& context,
+            _In_ GdbSrvControllerLib::AsynchronousGdbSrvController* pController);
+        void RemoveAllAmd64DataBreakpoints();
         ADDRESS_TYPE GetCurrentExecutionAddress(_Out_ DWORD *pProcessorNumberOfLastEvent);
         HRESULT SetGdbServerParameters();
         HRESULT SetGdbServerConnection(void);
@@ -337,7 +369,6 @@ public:
             _In_ ADDRESS_TYPE ntBaseAddress,
             _In_ ADDRESS_TYPE cr3);
         void OverlayKdDebuggerData(_In_ ADDRESS_TYPE address, _Inout_updates_bytes_(size) void* data, _In_ size_t size) const;
-        static DWORD CALLBACK NotificationThreadBody(LPVOID p);
         static VOID CALLBACK TimerCallback(_In_ HWND hwnd, _In_  UINT uMsg, _In_  UINT_PTR idEvent, _In_  DWORD dwTime);
 
 };

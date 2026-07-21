@@ -84,6 +84,7 @@ namespace GdbSrvControllerLib
         TARGET_HALTED stopReason;
         ULONG         processorNumber;
         AddressType   currentAddress;
+        AddressType   watchpointAddress;
         //  Stop reply packet response status
         struct {                   
             WORD isSAAPacket: 1;    //  Set if the stop reply packet is S AA format
@@ -94,7 +95,8 @@ namespace GdbSrvControllerLib
             WORD isPcRegFound: 1;   //  Set if the PC register was found in the response
             WORD isPowerDown: 1;    //  Set if the stop reply packet is 'S00' (Power down or target running).
             WORD isCoreRunning: 1;  //  Set if the stop reply packet is 'OK' (the Core is running or it's not unknown state)
-            WORD fUnUsed: 8;
+            WORD isWatchpointFound: 1; // Set if the stop reply contains watch/rwatch/awatch.
+            WORD fUnUsed: 7;
         } status;
 
     } StopReplyPacketStruct;

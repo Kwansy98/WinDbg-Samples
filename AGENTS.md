@@ -23,6 +23,7 @@ Before analyzing, editing, building, or operating WinDbg, read these files compl
 ```text
 docs/ai-maintenance-guide.md
 docs/vmware-exdi-kernel-debugging.md
+docs/exdi-manager.md
 ```
 
 They are the persistent source of truth for architecture, verified behavior, deployment, live evidence, and known limitations. Do not reconstruct the project history from assumptions when these documents already contain it.
@@ -54,7 +55,16 @@ Do not redesign or remove these capabilities unless live evidence proves a regre
 
 - For WinDbg investigations, collect live evidence before changing code. If `windbgskill` is available, use it for read-only inspection and controlled debugger commands.
 - Preserve the distinction between the EXDI COM server and optional WinDbg extensions.
-- Keep `exdi_manager.py` limited to status display, COM enable/disable, and WinDbg start/stop. Do not put build, deployment, cleanup, or source-maintenance logic into it.
+- Keep `exdi_manager.py` focused on portable runtime operation: strict sibling-artifact validation, HKCU COM registration, persistent target selection, read-only VMware snapshot polling, and per-session WinDbg start/stop. Do not put build, packaging, source cleanup, or source-maintenance logic into it.
+- Manager-launched EXDI sessions are always out-of-process. The manager registers a dedicated AppID, starts its `dllhost.exe` with package-local XML environment variables, and launches WinDbgX without `InProc`. Do not add an InProc mode or fallback.
+- The manager owns one configured `VMX + snapshot UID` and one active session. VMware GDB is fixed at `8864`, windbgskill is fixed at `26700`, and parallel sessions are deliberately unsupported.
+- A system-wide named mutex permits only one GUI manager instance across copies of the package. CLI diagnostics remain available while the GUI is running.
+- VM power-off and a change away from the selected snapshot trigger safe EXDI shutdown followed by a normal `WM_CLOSE` only for WinDbgX shells carrying the manager's unique launch signature. Same-snapshot restore is not observable from an unchanged snapshot UID alone.
+- Automatic start is a persisted, default-enabled option and consumes one attempt per target-snapshot match. Automatic and manual starts share one serialized, idempotent entry point. If an active WinDbgX session disappears while the target still matches, clean it and report the stopped state without automatically restarting; GUI Start and Restart are explicit user actions. Mutating CLI actions are rejected while the GUI owns the watcher.
+- Tk is owned exclusively by the GUI thread. Watcher notifications and worker results must enter the GUI through the thread-safe event queue; background threads must never call widgets or `after`. GUI refreshes use non-blocking watcher snapshots so lifecycle cleanup cannot freeze the window.
+- A prestarted `dllhost.exe` may remain as an idle COM container after DbgEng releases EXDI. Distinguish it from an active EXDI object by an `Established` connection from that surrogate PID to VMware GDB port `8864`: an idle container may be terminated, but a surrogate that still owns the GDB connection must not be force-killed while the VM is running.
+- Every GUI operation record is appended immediately to package-local UTF-8 `exdi_manager.log`; the release package does not include this runtime log.
+- The canonical local deployment is the git-ignored `artifacts/VMwareEXDI` directory. `package_exdi_manager.ps1` updates fixed package files there while preserving runtime config and logs.
 - Build and deployment remain explicit development operations described in the maintenance documents.
 - Update both the relevant implementation and its persistent documentation when behavior or a known limitation changes.
 - Do not push, rewrite history, merge upstream, or open a pull request unless the maintainer explicitly requests it.

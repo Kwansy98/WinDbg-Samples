@@ -229,7 +229,7 @@ unsigned AsynchronousGdbSrvController::CreateCodeBreakpoint(_In_ AddressType add
     }
     if (!isReplyOK)
     {
-        std::exception("Setting a Code breakpoint failed");
+        throw _com_error(E_FAIL);
     }
 
     return slot;
@@ -293,7 +293,7 @@ void AsynchronousGdbSrvController::DeleteCodeBreakpoint(_In_ unsigned breakpoint
     }
     if (!isReplyOK)
     {
-        std::exception("Deleting a Code breakpoint failed");
+        throw _com_error(E_FAIL);
     }
 }
 
@@ -324,7 +324,7 @@ void AsynchronousGdbSrvController::DeleteCodeBreakpoint(_In_ unsigned breakpoint
 //  Example:
 //  ba r4 0x81419120
 //  
-//  $Z3,81419120,32#e4
+//  $Z3,81419120,4#b5
 //  +
 //  $OK#9a
 //  +  
@@ -352,7 +352,6 @@ unsigned AsynchronousGdbSrvController::CreateDataBreakpoint(_In_ AddressType add
     if (targetArchitecture == AMD64_ARCH && dataAccessType == daRead)
     {
         dataAccessType = daBoth;
-        accessWidth = accessWidth / 8;
     }
 
     const char * pCommandType = GetDataAccessBreakPointCommand(dataAccessType, true);
@@ -384,7 +383,7 @@ unsigned AsynchronousGdbSrvController::CreateDataBreakpoint(_In_ AddressType add
     }
     if (!isReplyOK)
     {
-        std::exception("Setting a Data breakpoint failed");
+        throw _com_error(E_FAIL);
     }
 
     return slot;
@@ -425,7 +424,6 @@ void AsynchronousGdbSrvController::DeleteDataBreakpoint(_In_ unsigned breakpoint
     if (targetArchitecture == AMD64_ARCH && dataAccessType == daRead)
     {
         dataAccessType = daBoth;
-        accessWidth = accessWidth / 8;
     }
 
     const char * pCommandType = GetDataAccessBreakPointCommand(dataAccessType, false);
@@ -456,7 +454,7 @@ void AsynchronousGdbSrvController::DeleteDataBreakpoint(_In_ unsigned breakpoint
     }
     if (!isReplyOK)
     {
-        std::exception("Deleting a Data breakpoint failed");
+        throw _com_error(E_FAIL);
     }
 }
 
@@ -599,6 +597,17 @@ void AsynchronousGdbSrvController::StartStepCommand(unsigned processorNumber)
         {
             MessageBox(0, _T("Unable to set processor number or the GdbServer is not ready continue on any thread"), nullptr, MB_ICONERROR);
         }
+    }
+
+    ConfigExdiGdbServerHelper& cfgData =
+        ConfigExdiGdbServerHelper::GetInstanceCfgExdiGdbServer(nullptr);
+    if (cfgData.IsForcedLegacyResumeStepMode())
+    {
+        // The legacy RSP step packet is "s[addr]".  The processor has already
+        // been selected with Hc above; appending ":thread-id" is vCont syntax
+        // and can make VMware resume without ever returning a step stop.
+        StartAsynchronousCommand(g_GdbStep, false, true);
+        return;
     }
 
     //  Step by using the new command:

@@ -163,8 +163,8 @@ END_COM_MAP()
         /* [out] */ BOOL *pfEnabled)
     {
         if (pAddress == nullptr || pAddressMask == nullptr || pdwData == nullptr || pdwDataMask == nullptr ||
-            pbAccessWidth == nullptr || pmt == nullptr || pbAddressSpace == nullptr || pda != nullptr || 
-            pdwTotalBypassCount != nullptr || pdwBypassedOccurences != nullptr || pfEnabled != nullptr)
+            pbAccessWidth == nullptr || pmt == nullptr || pbAddressSpace == nullptr || pda == nullptr ||
+            pdwTotalBypassCount == nullptr || pdwBypassedOccurences == nullptr || pfEnabled == nullptr)
         {
             return E_POINTER;
         }

@@ -90,6 +90,30 @@ PCSTR const g_headerRegisterVerbose[] =
     "Access code"
 };
 
+namespace
+{
+    bool TryParseWatchpointAddress(_In_ const std::string& response, _Out_ AddressType* address)
+    {
+        assert(address != nullptr);
+
+        const std::string marker = "watch:";
+        const size_t markerOffset = response.find(marker);
+        if (markerOffset == std::string::npos)
+        {
+            return false;
+        }
+
+        ULONGLONG parsedAddress = 0;
+        const char* value = response.c_str() + markerOffset + marker.length();
+        if (sscanf_s(value, "%I64x", &parsedAddress) != 1)
+        {
+            return false;
+        }
+
+        *address = parsedAddress;
+        return true;
+    }
+}
 //=============================================================================
 // Private function definitions
 //=============================================================================
@@ -116,7 +140,7 @@ public:
         //  Bind the exdi functions
         SetExdiFunctions(exdiComponentFunctionList[0], std::bind(&GdbSrvControllerImpl::AttachGdbSrv,
             this, std::placeholders::_1, std::placeholders::_2));
-        SetExdiFunctions(exdiComponentFunctionList[0], std::bind(&GdbSrvControllerImpl::CloseGdbSrvCore,
+        SetExdiFunctions(exdiComponentFunctionList[1], std::bind(&GdbSrvControllerImpl::CloseGdbSrvCore,
             this, std::placeholders::_1, std::placeholders::_2));
         ConfigExdiGdbServerHelper& cfgData = ConfigExdiGdbServerHelper::GetInstanceCfgExdiGdbServer(nullptr);
         m_IsThrowExceptionEnabled = cfgData.IsExceptionThrowEnabled();
@@ -643,7 +667,7 @@ public:
     //  RequestTIB  Request the Windows OS specific thread information block.
     //
     //  Request:
-    //     qGetTIBAddr:thread-id’   where the 'thread-id' specifies the procesor number/thread ID.
+    //     qGetTIBAddr:thread-id'   where the 'thread-id' specifies the procesor number/thread ID.
     //
     //  Response:
     //      'OK'    for success.
@@ -1064,7 +1088,7 @@ public:
     //      'XXXXXXX...XXXXX'   This is a hex string where each byte will be represented by two hex digits.
     //                          The bytes are transmitted in target byte order. The size and the order are determined
     //                          by the target architecture.
-    //      ‘E NN’              Error reading the registers.
+    //      'E NN'              Error reading the registers.
     //
     //  Example:
     //  Get all registers (r command)
@@ -1124,7 +1148,7 @@ public:
     //      'XXXXXXX...XXXXX'   This is a hex string where each byte will be represented by two hex digits.
     //                          The bytes are transmitted in target byte order. The size and the order are determined
     //                          by the target architecture.
-    //      ‘E NN’              Error reading the registers.
+    //      'E NN'              Error reading the registers.
     //
     //  Example:
     //  Get all registers (r command)
@@ -1158,8 +1182,8 @@ public:
     //   https://sourceware.org/gdb/onlinedocs/gdb/Packets.html#Packets
     //
     //  Response:
-    //  ‘OK’                Success.
-    //  ‘E NN’              Error.
+    //  'OK'                Success.
+    //  'E NN'              Error.
     //
     //  Example:
     //  Set the 'es' register ($es=0x24)
@@ -1227,11 +1251,11 @@ public:
     //  A map containing the register name and its hex-decimal ascii value.
     //
     //  Request:
-    //  ‘p n’               Reads the register n (where the register number n is in hexadecimal ascii number).
+    //  'p n'               Reads the register n (where the register number n is in hexadecimal ascii number).
     //               
     //  Response:
-    //  ‘XX…’               Success.
-    //  ‘E NN’              Error.
+    //  'XX...'              Success.
+    //  'E NN'              Error.
     //  ''                  Ignore
     //
     //  Example:
@@ -1299,11 +1323,11 @@ public:
     //  A map containing the register name and its hex-decimal ascii value.
     //
     //  Request:
-    //  ‘p n’               Reads the register n (where the register number n is in hexadecimal ascii number).
+    //  'p n'               Reads the register n (where the register number n is in hexadecimal ascii number).
     //               
     //  Response:
-    //  ‘XX…’               Success.
-    //  ‘E NN’              Error.
+    //  'XX...'              Success.
+    //  'E NN'              Error.
     //  ''                  Ignore
     //
     //  Example:
@@ -1564,14 +1588,14 @@ public:
     //  A simple buffer object containing the memory content.
     //
     //  Request:
-    //      ‘m address,length’
+    //      'm address,length'
     //
     //  Response:
-    //      ‘XX...’     Memory contents.
+    //      'XX...'     Memory contents.
     //                  Each byte is transmitted as a two-digit ascii hexadecimal number. 
     //                  The response may contain fewer bytes than requested if the server 
     //                  was able to read only part of the region of memory. 
-    //      ‘E NN’      NN is the error number
+    //      'E NN'      NN is the error number
     //
     //  Example:
     //  Request:
@@ -1716,14 +1740,14 @@ public:
     //  false           otherwise.
     //
     //  Request:
-    //  ‘M address,length:XX...
+    //  'M address,length:XX...
     //   address:       The starting address
     //   length:        The number of bytes to write
     //   XX..           The data to write.
     //
     //  Response: 
-    //  ‘OK’            Success.
-    //  ‘E NN’          Error (includes the case where only part of the data was written). 
+    //  'OK'            Success.
+    //  'E NN'          Error (includes the case where only part of the data was written).
     //
     //  Example:
     //  Request:
@@ -1816,7 +1840,7 @@ public:
     //
     //  Request:
     //  The packet sequence contains two requests the first request packet is 'qfThreadInfo'
-    //  for subsequent requests is used ‘qsThreadInfo’. 
+    //  for subsequent requests is used 'qsThreadInfo'.
     //  'qfThreadInfo'
     //  'qsThreadInfo'
     //  
@@ -2074,6 +2098,11 @@ public:
                         }
                         pRspPacket->processorNumber = GetProcessorNumberByThreadId(processorIds[0]);
                     }
+                }
+
+                if (TryParseWatchpointAddress(cmdResponse, &pRspPacket->watchpointAddress))
+                {
+                    pRspPacket->status.isWatchpointFound = true;
                 }
 
                 //  Extract the current instruction address

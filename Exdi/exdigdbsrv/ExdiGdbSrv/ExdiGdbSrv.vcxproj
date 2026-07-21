@@ -419,7 +419,6 @@
     <ClInclude Include="commandLogger.h" />
     <ClInclude Include="dbgeng_exdi_io.h" />
     <ClInclude Include="dllmain.h" />
-    <ClInclude Include="InterfaceMarshalHelper.h" />
     <ClInclude Include="LiveExdiGdbSrvServer.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="stdafx.h" />

@@ -29,6 +29,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
+#include <unordered_map>
 #include <intrin.h>
 
 #define METHOD_NOT_IMPLEMENTED if (IsDebuggerPresent()) \
@@ -82,6 +84,8 @@ const int s_numberFPRegList = (ARRAYSIZE(s_fpRegList));
 
 namespace
 {
+    thread_local std::unordered_map<UINT_PTR, CLiveExdiGdbSrvServer*> g_timerOwners;
+
     char ToAsciiHex(_In_ unsigned char value)
     {
         return static_cast<char>(value < 10 ? ('0' + value) : ('A' + value - 10));
@@ -1270,6 +1274,7 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::Run(void)
         {
             return E_POINTER;
         }
+        ClearLastAmd64DataBreakpointHit();
         pController->ResetAsynchronousCmdStopReplyPacket();
         pController->StartRunCommand();
 
@@ -1281,7 +1286,6 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::Run(void)
         m_lastResumingCommandWasStep = false;
         pController->SetAsynchronousCmdStopReplyPacket();
         m_targetIsRunning = true;
-        ReleaseSemaphore(m_notificationSemaphore, 1, nullptr);
 
         return S_OK;
     }
@@ -1324,6 +1328,7 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::Halt(void)
             bool eventNotification = false;
             if (pController->HandleInterruptTarget(reinterpret_cast<AddressType *>(&currentAddress), &eventProcessor, &eventNotification))
             {
+                m_targetIsRunning = false;
                 if (currentAddress != 0)
                 {
                     m_lastPcAddress = currentAddress;
@@ -1366,6 +1371,7 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::DoSingleStep(DWORD dwProcessorN
         {
             return E_POINTER;
         }
+        ClearLastAmd64DataBreakpointHit();
         pController->ResetAsynchronousCmdStopReplyPacket();
         pController->StartStepCommand(dwProcessorNumber);
 
@@ -1377,7 +1383,6 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::DoSingleStep(DWORD dwProcessorN
         m_lastResumingCommandWasStep = true;
         pController->SetAsynchronousCmdStopReplyPacket();
         m_targetIsRunning = true;
-        ReleaseSemaphore(m_notificationSemaphore, 1, nullptr);
 
         return S_OK;
     }
@@ -1542,7 +1547,13 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::AddDataBreakpoint(
         {
             return E_POINTER;
         }
-        unsigned breakpointNumber = pController->CreateDataBreakpoint(Address, bAccessWidth, da);
+        constexpr BYTE bitsPerByte = 8;
+        if (bAccessWidth == 0 || bAccessWidth % bitsPerByte != 0)
+        {
+            return E_INVALIDARG;
+        }
+        const BYTE accessWidthInBytes = bAccessWidth / bitsPerByte;
+        unsigned breakpointNumber = pController->CreateDataBreakpoint(Address, accessWidthInBytes, da);
 
         BasicExdiDataBreakpoint * pBreakpoint = new CComObject<BasicExdiDataBreakpoint>();
         pBreakpoint->Initialize(Address, breakpointNumber, da, bAccessWidth);
@@ -1574,7 +1585,16 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::DelDataBreakpoint(
             AsynchronousGdbSrvController * pController = GetGdbSrvController();
             if (pController != nullptr)
             {
-                pController->DeleteDataBreakpoint(breakpointNumber, address, accessWidth, accessType);
+                constexpr BYTE bitsPerByte = 8;
+                if (accessWidth == 0 || accessWidth % bitsPerByte != 0)
+                {
+                    return E_INVALIDARG;
+                }
+                pController->DeleteDataBreakpoint(
+                    breakpointNumber,
+                    address,
+                    accessWidth / bitsPerByte,
+                    accessType);
                 result = S_OK;
             }
             else
@@ -2123,6 +2143,287 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::Ioctl(
     CATCH_AND_RETURN_HRESULT;
 }
 
+// DbgEng's Default data-breakpoint mode programs AMD64 DR state through the
+// context interface. Keep that state in the EXDI server and realize it with
+// GDB watchpoints so the guest debug registers remain untouched.
+void CLiveExdiGdbSrvServer::ClearLastAmd64DataBreakpointHit()
+{
+    m_lastHitAmd64DataBreakpoint = {};
+    m_lastHitAmd64DebugRegisterNumber = static_cast<unsigned>(m_virtualAmd64DataBreakpoints.size());
+    m_lastHitAmd64ProcessorNumber = (std::numeric_limits<DWORD>::max)();
+}
+
+bool CLiveExdiGdbSrvServer::RecordAmd64DataBreakpointHit(
+    _In_ ADDRESS_TYPE reportedAddress,
+    _In_ DWORD processorNumber)
+{
+    ClearLastAmd64DataBreakpointHit();
+
+    unsigned matchedRegister = static_cast<unsigned>(m_virtualAmd64DataBreakpoints.size());
+    for (unsigned debugRegister = 0;
+         debugRegister < m_virtualAmd64DataBreakpoints.size();
+         ++debugRegister)
+    {
+        const VirtualAmd64DataBreakpoint& breakpoint = m_virtualAmd64DataBreakpoints[debugRegister];
+        if (!breakpoint.active)
+        {
+            continue;
+        }
+
+        const bool exactMatch = breakpoint.address == reportedAddress;
+        const bool vmwareTruncatedMatch =
+            IsCurrentTargetVMware() &&
+            reportedAddress <= (std::numeric_limits<ULONG>::max)() &&
+            static_cast<ULONG>(breakpoint.address) == static_cast<ULONG>(reportedAddress);
+        if (!exactMatch && !vmwareTruncatedMatch)
+        {
+            continue;
+        }
+
+        if (matchedRegister < m_virtualAmd64DataBreakpoints.size())
+        {
+            AppendVMwareLog(
+                "virtual-dr ambiguous watchpoint hit reported=%I64x\n",
+                static_cast<ULONGLONG>(reportedAddress));
+            return false;
+        }
+
+        matchedRegister = debugRegister;
+    }
+
+    if (matchedRegister >= m_virtualAmd64DataBreakpoints.size())
+    {
+        AppendVMwareLog(
+            "virtual-dr unmatched watchpoint hit reported=%I64x\n",
+            static_cast<ULONGLONG>(reportedAddress));
+        return false;
+    }
+
+    m_lastHitAmd64DataBreakpoint = m_virtualAmd64DataBreakpoints[matchedRegister];
+    m_lastHitAmd64DebugRegisterNumber = matchedRegister;
+    m_lastHitAmd64ProcessorNumber = processorNumber;
+    return true;
+}
+
+void CLiveExdiGdbSrvServer::PopulateAmd64DebugRegisters(
+    _In_ DWORD processorNumber,
+    _Out_ PCONTEXT_X86_64 pContext) const
+{
+    assert(pContext != nullptr);
+
+    const auto populateBreakpoint = [pContext](
+        unsigned debugRegister,
+        const VirtualAmd64DataBreakpoint& breakpoint)
+    {
+        if (!breakpoint.active || debugRegister >= 4)
+        {
+            return;
+        }
+
+        const DWORD64 accessBits = breakpoint.accessType == daWrite ? 1 : 3;
+        DWORD64 lengthBits = 0;
+        switch (breakpoint.accessWidth)
+        {
+        case 1:
+            lengthBits = 0;
+            break;
+        case 2:
+            lengthBits = 1;
+            break;
+        case 4:
+            lengthBits = 3;
+            break;
+        case 8:
+            lengthBits = 2;
+            break;
+        default:
+            return;
+        }
+
+        switch (debugRegister)
+        {
+        case 0:
+            pContext->Dr0 = breakpoint.address;
+            break;
+        case 1:
+            pContext->Dr1 = breakpoint.address;
+            break;
+        case 2:
+            pContext->Dr2 = breakpoint.address;
+            break;
+        case 3:
+            pContext->Dr3 = breakpoint.address;
+            break;
+        }
+
+        const unsigned controlShift = 16 + (debugRegister * 4);
+        pContext->Dr7 |=
+            (1ULL << (debugRegister * 2)) |
+            ((accessBits | (lengthBits << 2)) << controlShift);
+    };
+
+    for (unsigned debugRegister = 0;
+         debugRegister < m_virtualAmd64DataBreakpoints.size();
+         ++debugRegister)
+    {
+        populateBreakpoint(debugRegister, m_virtualAmd64DataBreakpoints[debugRegister]);
+    }
+
+    if (processorNumber == m_lastHitAmd64ProcessorNumber &&
+        m_lastHitAmd64DebugRegisterNumber < m_virtualAmd64DataBreakpoints.size())
+    {
+        populateBreakpoint(
+            m_lastHitAmd64DebugRegisterNumber,
+            m_lastHitAmd64DataBreakpoint);
+        pContext->Dr6 = 1ULL << m_lastHitAmd64DebugRegisterNumber;
+    }
+}
+
+void CLiveExdiGdbSrvServer::SynchronizeAmd64DebugRegisters(
+    _In_ const CONTEXT_X86_64& context,
+    _In_ AsynchronousGdbSrvController* pController)
+{
+    assert(pController != nullptr);
+
+    const ADDRESS_TYPE addresses[] =
+    {
+        static_cast<ADDRESS_TYPE>(context.Dr0),
+        static_cast<ADDRESS_TYPE>(context.Dr1),
+        static_cast<ADDRESS_TYPE>(context.Dr2),
+        static_cast<ADDRESS_TYPE>(context.Dr3)
+    };
+    std::array<VirtualAmd64DataBreakpoint, 4> desiredBreakpoints{};
+
+    for (unsigned debugRegister = 0; debugRegister < desiredBreakpoints.size(); ++debugRegister)
+    {
+        const DWORD64 enableMask = 3ULL << (debugRegister * 2);
+        if ((context.Dr7 & enableMask) == 0)
+        {
+            continue;
+        }
+
+        const DWORD64 control = (context.Dr7 >> (16 + debugRegister * 4)) & 0xf;
+        DATA_ACCESS_TYPE accessType;
+        switch (control & 3)
+        {
+        case 1:
+            accessType = daWrite;
+            break;
+        case 3:
+            accessType = daBoth;
+            break;
+        default:
+            throw _com_error(E_INVALIDARG);
+        }
+
+        BYTE accessWidth;
+        switch ((control >> 2) & 3)
+        {
+        case 0:
+            accessWidth = 1;
+            break;
+        case 1:
+            accessWidth = 2;
+            break;
+        case 2:
+            accessWidth = 8;
+            break;
+        default:
+            accessWidth = 4;
+            break;
+        }
+
+        if (addresses[debugRegister] % accessWidth != 0)
+        {
+            throw _com_error(E_INVALIDARG);
+        }
+
+        desiredBreakpoints[debugRegister] =
+            {true, 0, addresses[debugRegister], accessWidth, accessType};
+    }
+
+    const auto hasSameConfiguration = [](
+        const VirtualAmd64DataBreakpoint& left,
+        const VirtualAmd64DataBreakpoint& right)
+    {
+        return left.active == right.active &&
+            left.address == right.address &&
+            left.accessWidth == right.accessWidth &&
+            left.accessType == right.accessType;
+    };
+
+    for (unsigned debugRegister = 0;
+         debugRegister < m_virtualAmd64DataBreakpoints.size();
+         ++debugRegister)
+    {
+        VirtualAmd64DataBreakpoint& current = m_virtualAmd64DataBreakpoints[debugRegister];
+        const VirtualAmd64DataBreakpoint& desired = desiredBreakpoints[debugRegister];
+        if (current.active && !hasSameConfiguration(current, desired))
+        {
+            pController->DeleteDataBreakpoint(
+                current.controllerBreakpointNumber,
+                current.address,
+                current.accessWidth,
+                current.accessType);
+            current = {};
+        }
+    }
+
+    for (unsigned debugRegister = 0;
+         debugRegister < m_virtualAmd64DataBreakpoints.size();
+         ++debugRegister)
+    {
+        VirtualAmd64DataBreakpoint& current = m_virtualAmd64DataBreakpoints[debugRegister];
+        const VirtualAmd64DataBreakpoint& desired = desiredBreakpoints[debugRegister];
+        if (!current.active && desired.active)
+        {
+            const unsigned controllerBreakpointNumber = pController->CreateDataBreakpoint(
+                desired.address,
+                desired.accessWidth,
+                desired.accessType);
+            current = desired;
+            current.controllerBreakpointNumber = controllerBreakpointNumber;
+        }
+    }
+}
+
+void CLiveExdiGdbSrvServer::RemoveAllAmd64DataBreakpoints()
+{
+    AsynchronousGdbSrvController* pController = GetGdbSrvController();
+    if (pController == nullptr)
+    {
+        return;
+    }
+
+    for (VirtualAmd64DataBreakpoint& breakpoint : m_virtualAmd64DataBreakpoints)
+    {
+        if (!breakpoint.active)
+        {
+            continue;
+        }
+
+        try
+        {
+            pController->DeleteDataBreakpoint(
+                breakpoint.controllerBreakpointNumber,
+                breakpoint.address,
+                breakpoint.accessWidth,
+                breakpoint.accessType);
+            breakpoint = {};
+        }
+        catch (...)
+        {
+            AppendVMwareLog(
+                "virtual-dr shutdown cleanup failed address=%I64x width=%u access=%u\n",
+                static_cast<ULONGLONG>(breakpoint.address),
+                breakpoint.accessWidth,
+                static_cast<unsigned>(breakpoint.accessType));
+        }
+    }
+
+    ClearLastAmd64DataBreakpointHit();
+}
+
 HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::GetLastHitBreakpoint(
     /* [out] */ DBGENG_EXDI3_GET_BREAKPOINT_HIT_OUT *pBreakpointInformation)
 {
@@ -2334,62 +2635,49 @@ HRESULT CLiveExdiGdbSrvServer::FinalConstruct()
     {
         return E_FAIL;
     }
-    m_pSelfReferenceForNotificationThread =
-        new InterfaceMarshalHelper<IAsynchronousCommandNotificationReceiver>(this, MSHLFLAGS_TABLEWEAK);
-
-    m_notificationSemaphore = CreateSemaphore(nullptr, 0, LONG_MAX, nullptr);
-    if (m_notificationSemaphore == nullptr)
-    {
-        return HRESULT_FROM_WIN32(GetLastError());
-    }
-    DWORD threadId;
-    m_notificationThread = CreateThread(nullptr, 0, NotificationThreadBody, this, 0, &threadId);
-    if (m_notificationThread == nullptr)
-    {
-        return HRESULT_FROM_WIN32(GetLastError());
-    }
-
     m_timerId = SetTimer(nullptr, 0, 100, TimerCallback);
-    assert(m_timerId != 0);
+    if (m_timerId == 0)
+    {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    g_timerOwners.emplace(m_timerId, this);
 
     return S_OK;
 }
 
-static DWORD WaitForSingleObjectWhileDispatchingMessages(HANDLE object, DWORD timeout)
-{
-    for (;;)
-    {
-        DWORD waitStatus = MsgWaitForMultipleObjectsEx(1, &object, timeout, QS_ALLEVENTS, 0);
-        if (waitStatus == WAIT_OBJECT_0 + 1)
-        {
-            MSG msg;
-
-            if (GetMessage(&msg, NULL, 0, 0))
-            {
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-        }
-        else
-        {
-            return waitStatus;
-        }
-    }
-}
-
 void CLiveExdiGdbSrvServer::FinalRelease()
 {
-    m_terminating = true;
-
     if (m_timerId != 0)
     {
         KillTimer(nullptr, m_timerId);
+        g_timerOwners.erase(m_timerId);
         m_timerId = 0;
     }
 
-    ReleaseSemaphore(m_notificationSemaphore, 1, nullptr);
-    WaitForSingleObjectWhileDispatchingMessages(m_notificationThread, INFINITE);
+    AsynchronousGdbSrvController* pController = GetGdbSrvController();
+    if (pController != nullptr && m_targetIsRunning)
+    {
+        AddressType currentAddress = static_cast<AddressType>(m_lastPcAddress);
+        DWORD eventProcessor = 0;
+        bool eventNotification = false;
+        if (pController->HandleInterruptTarget(
+                &currentAddress,
+                &eventProcessor,
+                &eventNotification) &&
+            eventNotification)
+        {
+            m_targetIsRunning = false;
+        }
+        else
+        {
+            AppendVMwareLog("virtual-dr shutdown could not halt target\n");
+        }
+    }
 
+    if (!m_targetIsRunning)
+    {
+        RemoveAllAmd64DataBreakpoints();
+    }
     delete m_pGdbSrvController;
     m_pGdbSrvController = nullptr;
 }
@@ -2602,7 +2890,8 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::GetContextEx(_In_ DWORD process
         pContext->RegGroupSelection.fIntegerRegs = TRUE;
 
         pContext->ModeFlags = AMD64_CONTEXT_AMD64 | AMD64_CONTEXT_CONTROL |
-                              AMD64_CONTEXT_INTEGER | AMD64_CONTEXT_SEGMENTS;
+                              AMD64_CONTEXT_INTEGER | AMD64_CONTEXT_SEGMENTS |
+                              AMD64_CONTEXT_DEBUG_REGISTERS;
 
         //  Segment registers
         pContext->SegCs = static_cast<DWORD>(GdbSrvController::ParseRegisterValue(registers["cs"]));
@@ -2631,6 +2920,19 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::GetContextEx(_In_ DWORD process
                     m_processorCr3.resize(processorNumber + 1);
                 }
                 m_processorCr3[processorNumber] = pContext->RegCr3;
+                if (m_amd64SystemRegisters.size() <= processorNumber)
+                {
+                    m_amd64SystemRegisters.resize(processorNumber + 1);
+                }
+                m_amd64SystemRegisters[processorNumber] =
+                {
+                    true,
+                    pContext->RegCr0,
+                    pContext->RegCr2,
+                    pContext->RegCr3,
+                    pContext->RegCr4,
+                    pContext->RegCr8
+                };
             }
             if ((pContext->SegCs & 3) == 0 && pContext->RegCr3 != 0)
             {
@@ -2690,7 +2992,8 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::GetContextEx(_In_ DWORD process
         }
 
         pContext->RegGroupSelection.fSegmentDescriptors = FALSE;
-        pContext->RegGroupSelection.fDebugRegs = FALSE;
+        PopulateAmd64DebugRegisters(processorNumber, pContext);
+        pContext->RegGroupSelection.fDebugRegs = TRUE;
 
         return S_OK;
     }
@@ -2746,7 +3049,7 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::SetContextEx(_In_ DWORD process
             registers["gs"] = pContext->SegGs;
         }
 
-        if (pContext->RegGroupSelection.fSystemRegisters)
+        if (pContext->RegGroupSelection.fFloatingPointRegs)
         {
             registers["fctrl"] = pContext->ControlWord;
             registers["fstat"] = pContext->StatusWord;
@@ -2760,27 +3063,27 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::SetContextEx(_In_ DWORD process
         //  Control registers
         if (pContext->RegGroupSelection.fSystemRegisters)
         {
-            //  Control registers (System registers)
-            registers["cr0"] = pContext->RegCr0;
-            registers["cr2"] = pContext->RegCr2;
-            registers["cr3"] = pContext->RegCr3;
-            registers["cr4"] = pContext->RegCr4;
-            registers["cr8"] = pContext->RegCr8;
+            // VMware monitor values are readable but have no verified write path.
+            // Accept DbgEng's unchanged context round trip and reject real writes.
+            if (processorNumber >= m_amd64SystemRegisters.size())
+            {
+                return E_NOTIMPL;
+            }
+
+            const Amd64SystemRegisters& current = m_amd64SystemRegisters[processorNumber];
+            if (!current.valid ||
+                current.cr0 != pContext->RegCr0 ||
+                current.cr2 != pContext->RegCr2 ||
+                current.cr3 != pContext->RegCr3 ||
+                current.cr4 != pContext->RegCr4 ||
+                current.cr8 != pContext->RegCr8)
+            {
+                return E_NOTIMPL;
+            }
         }
-        pController->SetRegisters(processorNumber, registers, false);
-        if (pContext->RegGroupSelection.fSystemRegisters && processorNumber < 256)
+        if (!registers.empty())
         {
-            if (m_processorCr3.size() <= processorNumber)
-            {
-                m_processorCr3.resize(processorNumber + 1);
-            }
-            m_processorCr3[processorNumber] = pContext->RegCr3;
-            if (pContext->RegGroupSelection.fSegmentRegs &&
-                (pContext->SegCs & 3) == 0 &&
-                pContext->RegCr3 != 0)
-            {
-                m_kernelCr3 = pContext->RegCr3;
-            }
+            pController->SetRegisters(processorNumber, registers, false);
         }
         registers.clear();
 
@@ -2806,6 +3109,11 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::SetContextEx(_In_ DWORD process
             }
             pController->SetRegisters(processorNumber, registers, true);
             registers.clear();
+        }
+
+        if (pContext->RegGroupSelection.fDebugRegs)
+        {
+            SynchronizeAmd64DebugRegisters(*pContext, pController);
         }
 
         return S_OK;
@@ -3140,67 +3448,55 @@ HRESULT CLiveExdiGdbSrvServer::SetGdbServerParameters()
     CATCH_AND_RETURN_HRESULT;
 }
 
-DWORD CALLBACK CLiveExdiGdbSrvServer::NotificationThreadBody(LPVOID p)
-{
-    CLiveExdiGdbSrvServer * pServer = reinterpret_cast<CLiveExdiGdbSrvServer *>(p);
-    AsynchronousGdbSrvController * pController = pServer->GetGdbSrvController();
-    assert(pController != nullptr);
-
-    HRESULT result = CoInitialize(nullptr);
-    assert(SUCCEEDED(result));
-    UNREFERENCED_PARAMETER(result);
-
-    for (;;)
-    {
-        DWORD waitResult = WaitForSingleObject(pServer->m_notificationSemaphore, 100);
-
-        if (pServer->m_terminating)
-        {
-            break;
-        }
-
-        assert(pServer->m_pSelfReferenceForNotificationThread != nullptr);
-
-        IAsynchronousCommandNotificationReceiver *pReceiver  =
-            pServer->m_pSelfReferenceForNotificationThread->TryUnmarshalInterfaceForCurrentThread();
-
-        if (!pServer->m_terminating)
-        {
-            if (pReceiver == nullptr)
-            {
-                throw new std::exception("Cannot send any requests to the main COM thread");
-            }
-
-            pReceiver->PerformKeepaliveChecks();
-
-            if (waitResult == WAIT_OBJECT_0)
-            {
-                if (pController->GetAsynchronousCommandResult(INFINITE, nullptr))
-                {
-                    pReceiver->OnAsynchronousCommandCompleted();
-                }
-            }
-        }
-
-        if (pReceiver != nullptr)
-        {
-            pReceiver->Release();
-        }
-    }
-
-    CoUninitialize();
-    return 0;
-}
-
 VOID CALLBACK CLiveExdiGdbSrvServer::TimerCallback(_In_  HWND hwnd, _In_  UINT uMsg, _In_  UINT_PTR idEvent, _In_  DWORD dwTime)
 {
     UNREFERENCED_PARAMETER(hwnd);
     UNREFERENCED_PARAMETER(uMsg);
-    UNREFERENCED_PARAMETER(idEvent);
     UNREFERENCED_PARAMETER(dwTime);
-    //  If your JTAG hardware supports polling mode rather than asynchronous notification mode, use this
-    //  method to poll whether the target has stopped on an event and send a notification to debugging engine
-    //  by calling m_pRunNotificationListener->NotifyRunStateChange().
+
+    const auto owner = g_timerOwners.find(idEvent);
+    if (owner == g_timerOwners.end())
+    {
+        return;
+    }
+
+    CLiveExdiGdbSrvServer* server = owner->second;
+    AsynchronousGdbSrvController* controller = server->GetGdbSrvController();
+    if (controller == nullptr)
+    {
+        return;
+    }
+
+    const HRESULT keepaliveResult = server->PerformKeepaliveChecks();
+    if (FAILED(keepaliveResult))
+    {
+        AppendVMwareLog("keepalive callback failed hr=%08x\n", keepaliveResult);
+    }
+
+    if (!server->m_targetIsRunning || controller->IsAsynchronousCommandInProgress())
+    {
+        return;
+    }
+
+    try
+    {
+        if (controller->GetAsynchronousCommandResult(0, nullptr))
+        {
+            const HRESULT notificationResult = server->OnAsynchronousCommandCompleted();
+            if (FAILED(notificationResult))
+            {
+                AppendVMwareLog("asynchronous completion callback failed hr=%08x\n", notificationResult);
+            }
+        }
+    }
+    catch (const std::exception& error)
+    {
+        AppendVMwareLog("asynchronous completion polling failed: %s\n", error.what());
+    }
+    catch (...)
+    {
+        AppendVMwareLog("asynchronous completion polling failed with an unknown exception\n");
+    }
 }
 
 HRESULT CLiveExdiGdbSrvServer::SetGdbServerConnection(void)
@@ -3274,6 +3570,25 @@ ADDRESS_TYPE CLiveExdiGdbSrvServer::ParseAsynchronousCommandResult(_Out_ DWORD *
             if (isParsed)
             {
                 attempts = 0;
+                const bool hasValidEventProcessor =
+                    stopReply.status.isThreadFound &&
+                    stopReply.processorNumber < pController->GetProcessorCount();
+                const bool isDataBreakpointHit =
+                    stopReply.status.isTAAPacket &&
+                    stopReply.status.isWatchpointFound &&
+                    hasValidEventProcessor &&
+                    RecordAmd64DataBreakpointHit(
+                        stopReply.watchpointAddress,
+                        stopReply.processorNumber);
+                if (stopReply.status.isTAAPacket &&
+                    stopReply.status.isWatchpointFound &&
+                    !hasValidEventProcessor)
+                {
+                    AppendVMwareLog(
+                        "virtual-dr watchpoint hit without valid processor reported=%I64x processor=%u\n",
+                        static_cast<ULONGLONG>(stopReply.watchpointAddress),
+                        stopReply.processorNumber);
+                }
                 //  Is it a OXX console packet?
                 if (stopReply.status.isOXXPacket)
                 {
@@ -3298,13 +3613,9 @@ ADDRESS_TYPE CLiveExdiGdbSrvServer::ParseAsynchronousCommandResult(_Out_ DWORD *
                         currentPcAddress = m_lastPcAddress = GetCurrentExecutionAddress(&pcAddressRequest);
                     }
 
-                    if (stopReply.status.isThreadFound)
+                    if (hasValidEventProcessor)
                     {
-                        assert(stopReply.processorNumber != static_cast<ULONG>(-1));
-                        if (stopReply.processorNumber <= pController->GetProcessorCount())
-                        {
-                            *pProcessorNumberOfLastEvent = stopReply.processorNumber;
-                        }
+                        *pProcessorNumberOfLastEvent = stopReply.processorNumber;
                     }
                     else
                     {
@@ -3342,7 +3653,8 @@ ADDRESS_TYPE CLiveExdiGdbSrvServer::ParseAsynchronousCommandResult(_Out_ DWORD *
                        *pHaltReason = hrUser;
                        break;
                     case TARGET_BREAK_SIGTRAP:
-                       *pHaltReason = hrBp;
+                       // DbgEng consults virtual DR6/DR7 for a step-like data-break event.
+                       *pHaltReason = isDataBreakpointHit ? hrStep : hrBp;
                        break;
                     default:
                        *pHaltReason = hrUnknown;
@@ -3596,6 +3908,14 @@ HRESULT STDMETHODCALLTYPE CLiveExdiGdbSrvServer::ExecuteExdiComponentFunction(
         if (pController == nullptr)
         {
             return E_POINTER;
+        }
+        if (_wcsicmp(pFunctionToExecute, L"close") == 0)
+        {
+            if (m_targetIsRunning)
+            {
+                return HRESULT_FROM_WIN32(ERROR_BUSY);
+            }
+            RemoveAllAmd64DataBreakpoints();
         }
         if (!pController->ExecuteExdiFunction(dwProcessorNumber, pFunctionToExecute))
         {
