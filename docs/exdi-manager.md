@@ -66,7 +66,7 @@ debugStub.hideBreakpoints = "TRUE"
 2. 枚举 VMware inventory 及各虚拟机的 `.vmsd` 快照。
 3. 要求用户选择一个精确快照。
 4. 将 VMX 路径、快照名称、快照 UID、内存快照标记和自动启动开关写入同目录 `exdi_manager.json`。
-5. 每 2 秒只读检查该 VMX 是否运行、当前快照 UID 是否匹配。
+5. 每 2 秒只读检查该 VMX 是否运行、当前快照 UID 是否匹配，以及 GDB 8864 监听进程的 VMX PID 是否换代。
 
 同一台机器只允许一个管理器 GUI。重复双击 BAT 时，第二个进程会提示管理器已经运行并立即退出；不同目录中的发布包也使用同一个系统级 mutex，不会绕过单实例限制。GUI 运行时命令行仍可执行只读 `status`；修改会话的操作统一由 GUI watcher 串行完成。
 
@@ -120,11 +120,11 @@ WinDbgX 通过 COM 调用运行在 `dllhost.exe` 中的 EXDI server。`ExdiGdbSr
 
 开启自动启动时，同一次快照匹配只触发一次。虚拟机关机或当前快照 UID 变成其他快照时，管理器会检测到目标离开，安全结束 EXDI 会话并关闭自己启动的 WinDbgX；目标快照再次运行时才会形成下一次自动启动事件。
 
+VMware 恢复内存快照时会重建 `vmware-vmx.exe`。管理器直接从 Windows TCP 表读取 GDB 8864 的监听进程 PID，并把 PID 换代视为一次新的 VM 生命周期，因此恢复同一个快照时即使 `.vmsd` 中的 UID 没变也能识别。原 EXDI socket 所属的旧 VMX 已经退出，旧会话不再具备执行 `bc/q` 的目标；管理器会清理自己启动的失效 WinDbgX 和 COM surrogate。若“自动启动 WinDbg”已开启，目标 UID 仍匹配时随即建立新会话；开关关闭时只清理旧会话，等待用户手动启动。
+
 如果已经活动的 WinDbgX 被外部关闭或异常退出，而目标快照仍然匹配，管理器会检测到 windbgskill 会话消失并完成残留清理，但不会自动重启。GUI 会提示会话已经结束，用户可点击“启动 WinDbg”。这样不会把用户主动关闭窗口误判为需要保活，也不会形成重启循环。
 
 自动启动和手动启动汇合到同一个串行、幂等的启动入口。启动阶段从未成功建立 windbgskill 时不会自动重试，90 秒后明确显示失败；可点击“启动 WinDbg”清理失败现场并重试。
-
-恢复到另一个快照可以可靠检测，因为 `.vmsd` 的 `snapshot.current` 会改变。正在目标快照中再次恢复同一个目标快照时，恢复前后的 UID 相同，当前轮询不能仅凭 VMware inventory 和 `.vmsd` 可靠区分这次事件。
 
 ## 安全结束会话
 
@@ -141,6 +141,8 @@ WinDbgX 通过 COM 调用运行在 `dllhost.exe` 中的 EXDI server。`ExdiGdbSr
 
 `ExdiGdbSrv.dll` 的 `FinalRelease` 会再次删除当前会话持有的数据断点并关闭 GDB socket。本 fork 不再创建跨 apartment 回调自身的通知线程；异步 GDB 完成和 keepalive 由 COM STA 自己的 100ms timer 处理，从结构上消除了通知线程与 `FinalRelease` 相互等待的析构死锁。WinDbgX 异常消失后，预启动的 `dllhost.exe` 可能作为空闲 COM 容器继续存在；进程存在本身不代表 EXDI 会话仍然活动。管理器以该 surrogate 是否仍保持到 VMware GDB 8864 的 `Established` 连接为清理判据：连接已经释放时可以结束空闲容器，连接仍存在时拒绝强制结束。管理器不会按进程名结束其他 WinDbgX，也不会用强制终止代替 DbgEng 的正常退出。
 
+唯一的强制清理场景是已确认 GDB 8864 的 VMX 监听 PID 换代。此时原调试连接的宿主 VMX 已经退出，无法也没有必要再向旧目标发送断点清理命令；管理器只结束带本工具专用命令行签名的 WinDbgX 和专用 AppID surrogate，不影响其他调试器进程。
+
 GUI 的 watcher 和按钮任务都运行在后台线程，但后台线程只向线程安全队列投递消息。Tk 主线程统一更新控件、弹窗和“操作记录”，并使用非阻塞状态快照刷新按钮，因此自动启动、结束或残留清理期间窗口仍可正常重绘和关闭。
 
 ## 命令行诊断
@@ -155,7 +157,7 @@ py -3 .\exdi_manager.py restart
 py -3 .\exdi_manager.py unregister
 ```
 
-- `status`：显示 GUI 是否运行、自动启动配置、VMware/快照是否匹配、会话状态、windbgskill 状态、COM 注册、专用 surrogate PID 和管理器 WinDbgX PID。
+- `status`：显示 GUI 是否运行、自动启动配置、VMware/快照是否匹配、GDB 监听 VMX PID、会话状态、windbgskill 状态、COM 注册、专用 surrogate PID 和管理器 WinDbgX PID。
 - `start`：目标快照匹配时幂等地启动 WinDbgX；已经运行时直接报告现状。
 - `stop`：按安全顺序结束当前会话。
 - `restart`：目标快照匹配时安全结束旧会话并重新启动 WinDbgX。

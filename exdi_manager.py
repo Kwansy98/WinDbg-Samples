@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -69,8 +70,11 @@ VMWARE_INVENTORY_PATH = Path(os.environ.get("APPDATA", "")) / "VMware" / "invent
 
 ERROR_FILE_NOT_FOUND = 2
 ERROR_ACCESS_DENIED = 5
+ERROR_INSUFFICIENT_BUFFER = 122
 ERROR_ALREADY_EXISTS = 183
+AF_INET = 2
 SYNCHRONIZE = 0x00100000
+TCP_TABLE_OWNER_PID_LISTENER = 3
 WM_CLOSE = 0x0010
 
 KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -80,6 +84,16 @@ KERNEL32.OpenMutexW.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
 KERNEL32.OpenMutexW.restype = wintypes.HANDLE
 KERNEL32.CloseHandle.argtypes = (wintypes.HANDLE,)
 KERNEL32.CloseHandle.restype = wintypes.BOOL
+IPHLPAPI = ctypes.WinDLL("iphlpapi", use_last_error=True)
+IPHLPAPI.GetExtendedTcpTable.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.BOOL,
+    wintypes.ULONG,
+    wintypes.ULONG,
+    wintypes.ULONG,
+)
+IPHLPAPI.GetExtendedTcpTable.restype = wintypes.DWORD
 USER32 = ctypes.WinDLL("user32", use_last_error=True)
 WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 USER32.EnumWindows.argtypes = (WNDENUMPROC, wintypes.LPARAM)
@@ -94,6 +108,17 @@ USER32.PostMessageW.restype = wintypes.BOOL
 
 class ManagerError(RuntimeError):
     pass
+
+
+class MibTcpRowOwnerPid(ctypes.Structure):
+    _fields_ = (
+        ("state", wintypes.DWORD),
+        ("local_address", wintypes.DWORD),
+        ("local_port", wintypes.DWORD),
+        ("remote_address", wintypes.DWORD),
+        ("remote_port", wintypes.DWORD),
+        ("owning_pid", wintypes.DWORD),
+    )
 
 
 def close_handle(handle: int) -> None:
@@ -348,6 +373,46 @@ def running_vm_paths() -> set[str]:
     return {normalized_path(line) for line in lines[1:] if line.strip()}
 
 
+def tcp_listener_pids(port: int) -> set[int]:
+    size = wintypes.DWORD()
+    table: ctypes.Array[ctypes.c_char] | None = None
+    while True:
+        result = IPHLPAPI.GetExtendedTcpTable(
+            table,
+            ctypes.byref(size),
+            False,
+            AF_INET,
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+        if result == ERROR_INSUFFICIENT_BUFFER:
+            table = ctypes.create_string_buffer(size.value)
+            continue
+        if result:
+            raise ctypes.WinError(result)
+        break
+
+    if table is None:
+        return set()
+
+    row_count = wintypes.DWORD.from_buffer_copy(table).value
+    row_size = ctypes.sizeof(MibTcpRowOwnerPid)
+    rows_offset = ctypes.sizeof(wintypes.DWORD)
+    listeners: set[int] = set()
+    for index in range(row_count):
+        row = MibTcpRowOwnerPid.from_buffer_copy(table, rows_offset + index * row_size)
+        if socket.ntohs(row.local_port & 0xFFFF) == port:
+            listeners.add(row.owning_pid)
+    return listeners
+
+
+def gdb_server_pid() -> int | None:
+    listeners = tcp_listener_pids(GDB_PORT)
+    if len(listeners) > 1:
+        raise ManagerError(f"GDB 端口 {GDB_PORT} 同时由多个进程监听：{sorted(listeners)}")
+    return next(iter(listeners), None)
+
+
 def list_registered_vms() -> list[dict[str, Any]]:
     if not VMWARE_INVENTORY_PATH.is_file():
         raise ManagerError(f"VMware inventory 不存在：{VMWARE_INVENTORY_PATH}")
@@ -469,6 +534,23 @@ def terminate_surrogates() -> None:
     time.sleep(0.5)
     for pid in surrogate_pids():
         run_process(["taskkill.exe", "/F", "/PID", str(pid), "/T"], timeout=10)
+
+
+def discard_stale_session() -> str:
+    windbg_pids = managed_windbg_pids()
+    for pid in windbg_pids:
+        run_process(["taskkill.exe", "/F", "/PID", str(pid), "/T"], timeout=10)
+    stale_surrogates = surrogate_pids()
+    terminate_surrogates()
+
+    details: list[str] = []
+    if windbg_pids:
+        details.append(f"WinDbgX PID={','.join(str(pid) for pid in windbg_pids)}")
+    if stale_surrogates:
+        details.append(f"COM surrogate PID={','.join(str(pid) for pid in stale_surrogates)}")
+    if not details:
+        return "失效的 EXDI 会话已经退出。"
+    return f"已清理失效的 {'、'.join(details)}。"
 
 
 def surrogate_gdb_pids(pids: list[int] | None = None) -> list[int]:
@@ -699,6 +781,8 @@ class Watcher:
         self._launch_started_at: float | None = None
         self._session_observed_active = False
         self._idle_message: str | None = None
+        self._vmx_pid: int | None = None
+        self._vmx_listener_missing = False
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -720,6 +804,8 @@ class Watcher:
             self._launch_started_at = None
             self._session_observed_active = False
             self._idle_message = None
+            self._vmx_pid = None
+            self._vmx_listener_missing = False
         self.request_scan()
 
     def set_auto_start(self, enabled: bool) -> ManagerConfig:
@@ -772,13 +858,48 @@ class Watcher:
         with self._lock:
             config = self.config
             target = config.target
+            previous_matches = self.target_matches
+            previous_vmx_pid = self._vmx_pid
+        vmx_pid = gdb_server_pid()
         vm_running, matches, vmware_state = target_vmware_state(target)
-        status = query_skill_status()
+        vmx_replaced = (
+            previous_vmx_pid is not None
+            and vmx_pid is not None
+            and vmx_pid != previous_vmx_pid
+        )
+        vmx_temporarily_missing = (
+            matches and previous_matches and previous_vmx_pid is not None and vmx_pid is None
+        )
+        if vmx_temporarily_missing:
+            with self._lock:
+                self.vmware_state = "目标快照正在运行；等待 VMware GDB 监听恢复"
+                self.target_matches = True
+                self.session_phase = "checking"
+                self.session_state = "VMX 正在恢复快照或重新启动"
+                if not self._vmx_listener_missing:
+                    self._vmx_listener_missing = True
+                    self._notify("VMware GDB 监听暂时消失，正在等待 VMX 恢复。")
+            return
+        status = None if vmx_replaced else query_skill_status()
         active = status is not None and status.get("state") != "no_target"
 
         with self._lock:
             self.vmware_state = vmware_state
             self.target_matches = matches
+            if vmx_pid is not None:
+                self._vmx_pid = vmx_pid
+                self._vmx_listener_missing = False
+
+            if vmx_replaced:
+                self._notify(
+                    f"检测到 VMware VMX 已重建（PID {previous_vmx_pid} -> {vmx_pid}），"
+                    "判定虚拟机已恢复快照或重新启动。"
+                )
+                self._notify(discard_stale_session())
+                self._automatic_start_consumed = False
+                self._launch_started_at = None
+                self._session_observed_active = False
+                self._idle_message = None
 
             if not matches:
                 if active or surrogate_pids() or managed_windbg_pids():
@@ -879,7 +1000,6 @@ class Watcher:
                 f"已手动启动 {target.vm_name} / {target.snapshot_name}；"
                 f"GDB={GDB_PORT}，windbgskill={WINDBGSKILL_PORT}。"
             )
-            self._notify(detail)
             return detail
 
     def stop_session(self) -> str:
@@ -932,7 +1052,6 @@ class Watcher:
                 f"已手动重启 {target.vm_name} / {target.snapshot_name}；"
                 f"GDB={GDB_PORT}，windbgskill={WINDBGSKILL_PORT}。"
             )
-            self._notify(detail)
             return detail
 
     def shutdown(self) -> str:
@@ -1286,6 +1405,7 @@ def status_payload() -> dict[str, Any]:
             "running": vm_running,
             "snapshot_matches": snapshot_matches,
             "detail": detail,
+            "vmx_pid": gdb_server_pid(),
         }
 
     return {
